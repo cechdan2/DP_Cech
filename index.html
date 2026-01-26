@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>JD Harvest Control</title>
+    <style>
+        :root {
+            --jd-green: #367C2B;
+            --jd-yellow: #FFDE00;
+            --bg-dark: #202020;
+            --panel-bg: #333333;
+            --border-color: #555;
+            --text-main: #ffffff;
+            --text-muted: #cccccc;
+            --gap-size: 4px;
+        }
+
+        * { box-sizing: border-box; }
+
+        body { 
+            font-family: 'Roboto Condensed', 'Segoe UI', sans-serif; 
+            background-color: #000; 
+            color: var(--text-main); 
+            margin: 0; padding: 0; height: 100vh; width: 100vw; 
+            overflow: hidden; display: flex; flex-direction: column; 
+        }
+
+        /* TOP BAR */
+        .top-bar {
+            height: 40px; background-color: var(--jd-green); color: white;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0 15px; border-bottom: 2px solid var(--jd-yellow); flex-shrink: 0;
+        }
+        .top-bar h1 { margin: 0; font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
+        .settings-icon { font-size: 1.2rem; cursor: pointer; padding: 5px; transition: transform 0.2s; }
+        .settings-icon:active { transform: rotate(90deg); }
+        .clock { font-weight: bold; font-size: 1.1rem; }
+
+        /* DASHBOARD LAYOUT */
+        .dashboard {
+            flex: 1; display: grid; 
+            grid-template-columns: 240px 1fr 220px; 
+            grid-template-rows: 1fr; 
+            gap: var(--gap-size); padding: var(--gap-size); 
+            background-color: #111;
+        }
+
+        .col-panel { display: flex; flex-direction: column; gap: var(--gap-size); height: 100%; }
+        
+        .widget {
+            background-color: var(--panel-bg); border: 1px solid var(--border-color);
+            border-radius: 2px; display: flex; flex-direction: column;
+            overflow: hidden; position: relative;
+        }
+
+        .w-header {
+            background: linear-gradient(to bottom, #444, #333); color: #ddd;
+            padding: 4px 8px; font-size: 0.8rem; text-transform: uppercase;
+            font-weight: bold; border-bottom: 1px solid #555;
+            display: flex; justify-content: space-between;
+        }
+        .w-header.green { background: var(--jd-green); color: white; }
+
+        .w-body { flex: 1; padding: 8px; display: flex; flex-direction: column; justify-content: center; }
+
+        /* STATS ROWS */
+        .stat-row {
+            display: flex; justify-content: space-between; align-items: center;
+            background: #222; margin-bottom: 4px; padding: 6px 8px;
+            border-left: 4px solid var(--jd-yellow);
+        }
+        .stat-val { font-size: 1.2rem; font-weight: bold; font-family: monospace; }
+        .stat-lbl { font-size: 0.7rem; color: #aaa; text-transform: uppercase; }
+
+        /* SENSORS */
+        .sensor-grid-visual {
+            display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, 1fr);
+            gap: 4px; height: 100%; width: 100%;
+        }
+        .sensor-box {
+            background: #252525; border: 1px solid #444;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            position: relative;
+        }
+        .s-id { position: absolute; top: 2px; left: 4px; font-size: 0.7rem; color: #666; }
+        .s-status { font-size: 1.2rem; font-weight: bold; z-index: 2; }
+        .s-fill {
+            position: absolute; bottom: 0; left: 0; right: 0; height: 0%;
+            background-color: var(--jd-green); opacity: 0.3; transition: height 0.3s;
+        }
+        .S-ON .s-fill { height: 100%; opacity: 0.2; }
+        .S-ON .s-status { color: #fff; }
+        .D-READY .s-fill { background-color: var(--jd-yellow); opacity: 0.5; height: 50%; }
+        .D-READY .s-status { color: var(--jd-yellow); }
+        .D-PUMPED { border: 2px solid var(--jd-green); background: #1b3e20; }
+        .D-PUMPED .s-fill { height: 100%; background-color: var(--jd-green); opacity: 1; }
+        .D-PUMPED .s-status { color: white; text-shadow: 0 1px 2px black; }
+
+        /* CONTROLS */
+        .control-grid { display: grid; grid-template-rows: repeat(4, 1fr); gap: 6px; height: 100%; }
+        button {
+            border: 1px solid #777; background: linear-gradient(180deg, #555, #333);
+            color: white; font-weight: bold; text-transform: uppercase; font-size: 1rem;
+            border-radius: 4px; cursor: pointer; position: relative;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+        }
+        button:active { top: 2px; box-shadow: none; }
+        button span { display: block; font-size: 0.7rem; opacity: 0.7; margin-top: 2px; }
+        .btn-start { background: linear-gradient(180deg, #4caf50, #2e7d32); border-color: #2e7d32; }
+        .btn-flush { background: linear-gradient(180deg, #ffeb3b, #fbc02d); color: black; border-color: #f9a825; }
+        .btn-stop  { background: linear-gradient(180deg, #f44336, #c62828); border-color: #b71c1c; }
+
+        /* DOSE WIDGET */
+        .dose-widget-container { display: flex; align-items: center; justify-content: space-between; height: 100%; padding: 5px 0; }
+        .dose-btn { background: #444; border: 1px solid #666; color: white; font-size: 1.5rem; width: 45px; height: 100%; border-radius: 4px; cursor: pointer; }
+        .dose-btn:active { background: var(--jd-yellow); color: black; }
+        .glass-container { position: relative; width: 70px; height: 100%; margin: 0 10px; }
+        .glass-body { width: 100%; height: 100%; background: rgba(255,255,255,0.05); border: 3px solid #888; border-top: none; border-radius: 0 0 15px 15px; position: relative; overflow: hidden; box-shadow: inset 0 0 10px rgba(0,0,0,0.5); }
+        .glass-liquid { position: absolute; bottom: 0; left: 0; width: 100%; height: 50%; background-color: var(--jd-green); transition: height 0.3s ease-in-out; box-shadow: 0 0 5px var(--jd-green); }
+        .glass-text-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: white; text-shadow: 1px 1px 3px rgba(0,0,0,1); z-index: 2; }
+        .dose-val-big { font-size: 1.8rem; font-weight: bold; font-family: monospace; color: var(--jd-yellow); }
+        .dose-unit-small { font-size: 0.8rem; text-transform: uppercase; }
+
+        /* MODAL COMMON */
+        .modal {
+            display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.85); justify-content: center; align-items: center;
+        }
+        .modal-content {
+            background-color: #222; border: 2px solid var(--jd-yellow);
+            padding: 20px; border-radius: 4px; width: 95%; max-width: 600px;
+            color: white; box-shadow: 0 0 20px rgba(0,0,0,0.7);
+        }
+        .close-btn { background: #444; border: 1px solid #666; width: 100%; margin-top: 20px; padding: 15px; color: white; font-weight: bold; cursor: pointer; }
+        
+        /* CALIBRATION SPECIFIC */
+        .calib-list { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .calib-row { display: flex; flex-direction: column; background: #333; padding: 10px; border: 1px solid #444; }
+        input[type=range] { width: 100%; margin: 5px 0; -webkit-appearance: none; background: transparent; }
+        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #555; border-radius: 4px; }
+        input[type=range]::-webkit-slider-thumb { height: 20px; width: 20px; border-radius: 50%; background: var(--jd-yellow); cursor: pointer; -webkit-appearance: none; margin-top: -6px; }
+
+        /* PIN KEYPAD SPECIFIC */
+        .pin-display {
+            background: #000; color: var(--jd-yellow); font-size: 2rem; text-align: center; 
+            padding: 10px; margin-bottom: 15px; border: 1px solid #555; font-family: monospace; letter-spacing: 5px;
+        }
+        .pin-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .pin-key { background: #333; color: white; border: 1px solid #555; padding: 15px; font-size: 1.2rem; font-weight: bold; cursor: pointer; }
+        .pin-key:active { background: var(--jd-yellow); color: black; }
+        .pin-key.clear { background: #d32f2f; }
+        .pin-key.enter { background: var(--jd-green); }
+
+    </style>
+</head>
+<body>
+
+    <div class="top-bar">
+        <h1>Eurofarms Agro-Bot</h1>
+        <div style="display:flex; gap:15px; align-items:center;">
+            <div class="clock" id="clock">--:--</div>
+            <div class="settings-icon" onclick="openPinModal()">⚙️</div>
+        </div>
+    </div>
+
+    <div class="dashboard">
+        <div class="col-panel">
+            <div class="widget" style="flex: 0 0 auto;">
+                <div class="w-header green">Počítadla</div>
+                <div class="w-body" style="padding: 4px;">
+                    <div class="stat-row">
+                        <span class="stat-lbl">Session</span>
+                        <span class="stat-val" id="sessionShots">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-lbl">Total</span>
+                        <span class="stat-val" id="totalShots">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-lbl">Objem</span>
+                        <span class="stat-val" id="volumeDisplay">0 ml</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-lbl">Provoz</span>
+                        <span class="stat-val" id="runtimeDisplay">0h 0m</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="widget" style="flex: 0 0 auto;">
+                <div class="w-header">Stav Systému</div>
+                <div class="w-body" style="background:black; text-align:center;">
+                    <h2 id="systemStatus" style="margin:0; color:#007bff;">IDLE</h2>
+                </div>
+            </div>
+
+            <div class="widget" style="flex: 1;">
+                <div class="w-header">Cílová Dávka</div>
+                <div class="w-body">
+                    <div class="dose-widget-container">
+                        <button class="dose-btn" onclick="changeDose(-5)">-</button>
+                        <div class="glass-container">
+                            <div class="glass-body">
+                                <div class="glass-liquid" id="glassFill" style="height: 50%;"></div>
+                                <div class="glass-text-overlay">
+                                    <div class="dose-val-big" id="targetDoseDisplay">40</div>
+                                    <div class="dose-unit-small">ml</div>
+                                </div>
+                            </div>
+                        </div>
+                        <button class="dose-btn" onclick="changeDose(5)">+</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-panel">
+            <div class="widget" style="height: 100%;">
+                <div class="w-header">Monitoring Zásobníků</div>
+                <div class="w-body" style="background:#000; padding:4px;">
+                    <div class="sensor-grid-visual" id="sensorGrid"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-panel">
+            <div class="widget" style="height: 100%;">
+                <div class="w-header">Rychlá Volba</div>
+                <div class="w-body">
+                    <div class="control-grid">
+                        <button class="btn-start" id="mainButton">START<span>AUTO SEQUENCE</span></button>
+                        <button class="btn-flush" id="flushButton">PROPLACH<span>CLEANING</span></button>
+                        <button style="opacity:0.5; cursor:default;">LIGHTS<span>(AUTO)</span></button>
+                        <button class="btn-stop" onclick="confirmShutdown()">SHUTDOWN<span>SYSTEM OFF</span></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="pinModal" class="modal">
+        <div class="modal-content" style="max-width: 320px;">
+            <h2 style="color:var(--jd-yellow); text-align:center; margin-top:0;">ZADEJTE PIN</h2>
+            <div id="pinDisplay" class="pin-display">_ _ _ _</div>
+            <div class="pin-grid">
+                <button class="pin-key" onclick="addPin(1)">1</button>
+                <button class="pin-key" onclick="addPin(2)">2</button>
+                <button class="pin-key" onclick="addPin(3)">3</button>
+                <button class="pin-key" onclick="addPin(4)">4</button>
+                <button class="pin-key" onclick="addPin(5)">5</button>
+                <button class="pin-key" onclick="addPin(6)">6</button>
+                <button class="pin-key" onclick="addPin(7)">7</button>
+                <button class="pin-key" onclick="addPin(8)">8</button>
+                <button class="pin-key" onclick="addPin(9)">9</button>
+                <button class="pin-key clear" onclick="clearPin()">C</button>
+                <button class="pin-key" onclick="addPin(0)">0</button>
+                <button class="pin-key enter" onclick="checkPin()">OK</button>
+            </div>
+            <button class="close-btn" onclick="closePin()" style="margin-top:10px;">ZRUŠIT</button>
+        </div>
+    </div>
+
+    <div id="calibModal" class="modal">
+        <div class="modal-content">
+            <div style="border-bottom:1px solid #444; padding-bottom:10px; margin-bottom:15px; display:flex; justify-content:space-between;">
+                <h2 style="color:var(--jd-yellow); margin:0;">KALIBRACE SERVA</h2>
+                <span style="color:#aaa;">DIAGNOSTIC</span>
+            </div>
+            <div id="calibList" class="calib-list">Načítám...</div>
+            <button class="close-btn" onclick="closeCalibration()">ULOŽIT A ZAVŘÍT</button>
+        </div>
+    </div>
+
+    <script>
+        // --- KONFIGURACE ---
+        const MIN_ML = 35;
+        const MAX_ML = 120;
+        const CORRECT_PIN = "1234"; // Váš tajný kód pro servis
+
+        let targetDoseML = 40;
+        
+        // --- PIN LOGIKA ---
+        let currentPin = "";
+        const pinModal = document.getElementById('pinModal');
+        const pinDisplay = document.getElementById('pinDisplay');
+
+        function openPinModal() {
+            currentPin = "";
+            updatePinDisplay();
+            pinModal.style.display = 'flex';
+        }
+        function closePin() { pinModal.style.display = 'none'; }
+        
+        function addPin(n) {
+            if(currentPin.length < 4) { currentPin += n; updatePinDisplay(); }
+        }
+        function clearPin() { currentPin = ""; updatePinDisplay(); }
+        
+        function updatePinDisplay() {
+            let d = "";
+            for(let i=0; i<4; i++) d += (i < currentPin.length) ? "*" : "_";
+            pinDisplay.innerText = d;
+        }
+
+        function checkPin() {
+            if(currentPin === CORRECT_PIN) {
+                closePin();
+                openCalibration(); // Otevře skutečné menu
+            } else {
+                alert("CHYBNÝ PIN!");
+                clearPin();
+            }
+        }
+
+        // --- HLAVNÍ LOGIKA ---
+        function updateClock() { document.getElementById('clock').textContent = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+        setInterval(updateClock, 1000); updateClock();
+
+        const sensorGrid = document.getElementById('sensorGrid');
+        for (let i = 0; i < 6; i++) {
+            sensorGrid.innerHTML += `<div class="sensor-box" id="sensor_${i}"><div class="s-id">Z${i+1}</div><div class="s-fill"></div><div class="s-status" id="txt_${i}">-</div></div>`;
+        }
+
+        const els = {
+            sysStatus: document.getElementById('systemStatus'),
+            session: document.getElementById('sessionShots'),
+            total: document.getElementById('totalShots'),
+            volume: document.getElementById('volumeDisplay'),
+            runtime: document.getElementById('runtimeDisplay'),
+            doseDisp: document.getElementById('targetDoseDisplay'),
+            glassFill: document.getElementById('glassFill')
+        };
+
+        function changeDose(amount) {
+            targetDoseML += amount;
+            if (targetDoseML < MIN_ML) targetDoseML = MIN_ML;
+            if (targetDoseML > MAX_ML) targetDoseML = MAX_ML;
+            updateDoseDisplay();
+            let potVal = Math.round(((targetDoseML - MIN_ML) / (MAX_ML - MIN_ML)) * 1023);
+            if(potVal < 0) potVal = 0; if(potVal > 1023) potVal = 1023;
+            sendControl('pot_set', potVal);
+        }
+
+        function updateDoseDisplay() {
+            els.doseDisp.innerText = targetDoseML;
+            let percent = ((targetDoseML - MIN_ML) / (MAX_ML - MIN_ML)) * 100;
+            if (percent < 5) percent = 5; if (percent > 100) percent = 100;
+            els.glassFill.style.height = percent + "%";
+        }
+
+        async function sendControl(action, value = null) {
+            try { await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, value})}); } catch(e){}
+        }
+
+        async function updateStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+
+                els.sysStatus.textContent = data.system;
+                els.sysStatus.style.color = data.system === 'RUNNING_SEQ' ? '#FFDE00' : data.system === 'FLUSHING' ? '#00e676' : '#4fc3f7';
+                
+                els.session.textContent = data.stats.session_shots;
+                els.total.textContent = data.stats.total_shots;
+                
+                if (data.display_stats) {
+                    els.volume.textContent = data.display_stats.volume;
+                    els.runtime.textContent = data.display_stats.runtime;
+                }
+
+                let serverPot = data.pot_value;
+                let calculatedML = Math.round((serverPot / 1023.0) * (MAX_ML - MIN_ML) + MIN_ML);
+                if (Math.abs(calculatedML - targetDoseML) > 5) {
+                    targetDoseML = calculatedML;
+                    updateDoseDisplay();
+                }
+
+                Object.keys(data.sensors).forEach(idx => {
+                    const s = data.sensors[idx];
+                    const box = document.getElementById(`sensor_${idx}`);
+                    const txt = document.getElementById(`txt_${idx}`);
+                    box.className = 'sensor-box';
+                    let label = 'EMPTY';
+                    if (s.DOSE === 'PUMPED') { box.classList.add('D-PUMPED'); label = 'OK'; }
+                    else if (s.SENSOR === 'ON') {
+                        box.classList.add('S-ON');
+                        label = s.DOSE === 'READY' ? (box.classList.add('D-READY'), 'READY') : 'DETECT';
+                    }
+                    txt.textContent = label;
+                });
+            } catch(e){}
+        }
+
+        const bindBtn = (id, act) => {
+            const b = document.getElementById(id);
+            ['mousedown','touchstart'].forEach(e=>b.addEventListener(e, (ev)=>{if(ev.type=='touchstart')ev.preventDefault(); sendControl(act+'_down')}));
+            ['mouseup','touchend'].forEach(e=>b.addEventListener(e, (ev)=>{if(ev.type=='touchend')ev.preventDefault(); sendControl(act+'_up')}));
+        };
+        bindBtn('mainButton','main'); bindBtn('flushButton','flush');
+
+        function confirmShutdown() { if(confirm("Vypnout systém?")) fetch('/api/system/shutdown', {method:'POST'}); }
+
+        // --- KALIBRACE (Volá se až po úspěšném PINu) ---
+        const modal = document.getElementById('calibModal');
+        const calibList = document.getElementById('calibList');
+        async function openCalibration() {
+            try {
+                const res = await fetch('/api/calibration');
+                const pos = await res.json();
+                calibList.innerHTML = '';
+                pos.forEach((ang, i) => {
+                    calibList.innerHTML += `
+                    <div class="calib-row"><div style="display:flex;justify-content:space-between;color:#aaa;font-size:0.8rem;margin-bottom:5px;"><span>POZICE Z${i+1}</span><span style="color:var(--jd-yellow);font-weight:bold;font-family:monospace;" id="val_${i}">${ang}°</span></div>
+                    <input type="range" min="0" max="180" value="${ang}" onchange="updateServo(${i},this.value)" oninput="document.getElementById('val_${i}').innerText=this.value+'°'"></div>`;
+                });
+                modal.style.display = 'flex';
+            } catch(e) { alert("Chyba kalibrace"); }
+        }
+        function closeCalibration() { modal.style.display = 'none'; }
+        async function updateServo(i, a) { await fetch('/api/calibration', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index:i, angle:a})}); }
+
+        setInterval(updateStatus, 500); updateStatus();
+        updateDoseDisplay(); 
+    </script>
+</body>
+</html>
