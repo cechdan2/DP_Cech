@@ -1,0 +1,617 @@
+#include <Servo.h>
+#include <Adafruit_NeoPixel.h>
+#include <avr/wdt.h> 
+
+//PINY A KONSTANTY
+const int irSensors[6] = {4, 6, 7, 8, A1, A2};
+const int irEmitterPin = 11;    // HW časovač 2 pro IR 38kHz
+const int estopPin = 2;         // Hardware interrupt pro E-STOP
+const int rgbLedPin = 10;
+const int servoPin = 9;         // HW časovač 1 pro Servo
+const int pumpPin = 5;          // HW časovač 0 pro PWM čerpadla
+const int orangeLedPin = 13;    
+const int powerLightsPin = 12;
+
+const int PUMP_PWM = 150;       // Pracovní bod čerpadla
+
+// Výchozí kalibrační úhly pro jednotlivé pozice
+int servoPositions[6] = {157, 141, 125, 104, 87, 68};
+
+// Debouncing senzorů
+const int detectionThreshold = 50;
+int sensorCounters[6] = {0, 0, 0, 0, 0, 0};
+
+unsigned long lastSerialTime = 0;      
+const unsigned long COMM_TIMEOUT = 5000; // Timeout pro ztrátu spojení s RPi
+bool isConnected = false;          
+
+//OBJEKTY A STAVY 
+
+Servo servo;
+Adafruit_NeoPixel rgbLeds = Adafruit_NeoPixel(6, rgbLedPin, NEO_RGB + NEO_KHZ800);
+
+// Hlavní stavový automat
+enum State { IDLE, RUNNING_SEQUENCE, FLUSHING, ERROR_NO_CONN, ESTOP, SYSTEM_HOMING, CALIBRATION_CHECK };
+State currentState = SYSTEM_HOMING; 
+
+// Sub-stavy pro dávkovací sekvenci
+enum SeqSubState { SEQ_FIND_NEXT, SEQ_MOVING_TO_TARGET, SEQ_PUMPING, SEQ_WAIT_AFTER, SEQ_RETURNING_HOME };
+SeqSubState seqState = SEQ_FIND_NEXT;
+
+enum FlushSubState { FLUSH_INIT, FLUSH_MOVING_TO_DRAIN, FLUSH_PUMPING, FLUSH_WAIT_AFTER, FLUSH_MOVING_HOME };
+FlushSubState flushSubState = FLUSH_INIT;
+
+enum CalibSubState { CALIB_MOVE_TO_TARGET, CALIB_WAIT, CALIB_RETURN_HOME };
+CalibSubState calibSubState = CALIB_MOVE_TO_TARGET;
+int calibTargetAngle = 180; 
+
+//PROMĚNNÉ 
+String serialInputString = "";         
+bool virtualMainButtonState = HIGH;    
+bool lastVirtualMainButtonState = HIGH; 
+bool virtualFlushButtonState = HIGH;   
+
+// Proměnné pro ISR (volatile)
+volatile bool estopTriggered = false;  
+volatile bool estopIRQ = false;
+
+bool previousSensorStates[6] = {false};
+int previousDoseStates[6] = {-1};
+State previousSystemState = (State)-1;
+
+// Proměnné pro neblokující pohyb serva
+unsigned long lastServoMoveTime = 0;
+const int servoRestPosition = 180;     
+int currentServoPosition = servoRestPosition; 
+
+unsigned long pumpStartTime = 0;
+unsigned long waitStartTime = 0;
+int targetServoPos = 180;
+
+// Čas čerpání přijatý z RPi
+unsigned long nextPumpDuration = 2000; 
+
+bool alreadyPumped[6] = {false};       
+bool wasRemoved[6] = {false};          
+bool sensorsState[6] = {false};        
+
+int currentPumpIndex = -1;             
+bool flushingActive = false; 
+int ledBrightness = 20;               
+
+
+//FUNKCE
+
+// Přímý zápis do registrů pro přesné generování 38kHz nosné frekvence (IR)
+void setup38kHz() {
+  pinMode(irEmitterPin, OUTPUT);
+  TCCR2A = _BV(COM2A0) | _BV(WGM21); 
+  TCCR2B = _BV(CS20);                
+  OCR2A = 209;                       
+}
+
+// ISR pro E-STOP
+void handleEstop() {
+  estopIRQ = true;
+}
+
+// Výpočet XOR checksumu pro sériovou linku
+byte calcCS(String &data) {
+  byte xorSum = 0;
+  for (int i = 0; i < data.length(); i++) xorSum ^= data[i];
+  return xorSum;
+}
+
+// Odeslání zprávy s checksumem
+void sendSecure(String data) {
+  byte cs = calcCS(data);
+  Serial.print("$"); Serial.print(data); Serial.print("*");
+  if (cs < 0x10) Serial.print("0"); Serial.println(cs, HEX);
+}
+
+// Neblokující inkrementální pohyb serva 
+bool processServoMove(int target) {
+  if (!servo.attached()) {
+    servo.write(currentServoPosition); 
+    servo.attach(servoPin);
+  }
+  
+  if (currentServoPosition == target) return true;
+
+  if (millis() - lastServoMoveTime >= 6) { 
+    lastServoMoveTime = millis(); 
+    
+    if (currentServoPosition < target) currentServoPosition++;
+    else if (currentServoPosition > target) currentServoPosition--;
+    
+    servo.write(currentServoPosition);
+  }
+  
+  return (currentServoPosition == target);
+}
+
+// Nouzové zastavení všech akčních členů
+void emergencyStop() {
+  analogWrite(pumpPin, 0);   
+  flushingActive = false;
+  seqState = SEQ_FIND_NEXT;
+  flushSubState = FLUSH_INIT;
+  calibSubState = CALIB_MOVE_TO_TARGET; 
+  
+  virtualFlushButtonState = HIGH; 
+  virtualMainButtonState = HIGH;  
+  
+  if (servo.attached()) servo.detach(); 
+}
+
+// Reportování stavů pouze při změně
+void reportStatusUpdates() {
+  if (!isConnected) return;
+  static unsigned long lastReport = 0;
+  if (millis() - lastReport < 15) return; 
+  lastReport = millis();
+
+  if (currentState != previousSystemState) {
+    String msg = "STATUS:SYSTEM;";
+    switch (currentState) {
+      case IDLE: msg += "IDLE"; break;
+      case RUNNING_SEQUENCE: msg += "RUNNING_SEQ"; break;
+      case FLUSHING: msg += "FLUSHING"; break;
+      case ERROR_NO_CONN: msg += "ERROR_CONNECTION"; break;
+      case ESTOP: msg += "ESTOP"; break;
+      case SYSTEM_HOMING: msg += "HOMING"; break;
+      case CALIBRATION_CHECK: msg += "CALIBRATION"; break; 
+    }
+    sendSecure(msg);
+    previousSystemState = currentState;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    if (sensorsState[i] != previousSensorStates[i]) {
+      sendSecure("STATUS:SENSOR;" + String(i) + ";" + (sensorsState[i] ? "ON" : "OFF"));
+      previousSensorStates[i] = sensorsState[i];
+    }
+    
+    int currentDoseStateRaw = 0;
+    if (alreadyPumped[i]) currentDoseStateRaw = 2;
+    else if (sensorsState[i]) currentDoseStateRaw = 1;
+    else if (wasRemoved[i]) currentDoseStateRaw = 3;
+
+    if (currentDoseStateRaw != previousDoseStates[i]) {
+      String msg = "STATUS:DOSE;" + String(i) + ";";
+      switch (currentDoseStateRaw) {
+        case 0: msg += "IDLE"; break;
+        case 1: msg += "READY"; break;
+        case 2: msg += "PUMPED"; break;
+        case 3: msg += "REMOVED"; break;
+      }
+      sendSecure(msg);
+      previousDoseStates[i] = currentDoseStateRaw;
+    }
+  }
+}
+
+//KOMUNIKACE S RASPBERRY PI
+void handleSerialInput() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n') { 
+      serialInputString.trim();
+      if (serialInputString.startsWith("$")) {
+        int starIdx = serialInputString.lastIndexOf('*');
+        if (starIdx > 0) {
+          String content = serialInputString.substring(1, starIdx);
+          String recHex = serialInputString.substring(starIdx + 1);
+          long recCalcLong = strtol(recHex.c_str(), NULL, 16);
+          
+          // Kontrola checksumu
+          if (calcCS(content) == (byte)recCalcLong) { 
+            int colonIdx = content.indexOf(':');
+            String cmdName = (colonIdx != -1) ? content.substring(0, colonIdx) : content;
+            sendSecure("ACK:" + cmdName);
+
+            if (currentState == ERROR_NO_CONN) currentState = IDLE;
+            isConnected = true; 
+            lastSerialTime = millis();
+
+// Parsování příkazů
+            if (content.startsWith("INPUT:")) {
+              int i1 = content.indexOf(':'); int i2 = content.indexOf(';', i1 + 1); int i3 = content.lastIndexOf(';');
+              String type = content.substring(i1 + 1, i2);
+              String val = content.substring(i3 + 1);
+              if (type.equals("BUTTON_MAIN")) virtualMainButtonState = (val.toInt() == 1) ? LOW : HIGH;
+            }
+            else if (content.startsWith("PUMP:")) {
+                nextPumpDuration = content.substring(5).toInt();
+            }
+            else if (content.startsWith("FLUSH:")) {
+                int state = content.substring(6).toInt();
+                virtualFlushButtonState = (state == 1) ? LOW : HIGH; 
+            }
+            else if (content.startsWith("CALIB:")) {
+              int sIdx = content.indexOf(';');
+              int i = content.substring(6, sIdx).toInt();
+              int ang = content.substring(sIdx + 1).toInt();
+              
+              if (i >= 0 && i < 6) {
+                 servoPositions[i] = constrain(ang, 50, 180);
+                 if (currentState == IDLE) {
+                    calibTargetAngle = servoPositions[i];
+                    calibSubState = CALIB_MOVE_TO_TARGET;
+                    currentState = CALIBRATION_CHECK;
+                    servo.write(currentServoPosition);
+                    if (!servo.attached()) servo.attach(servoPin);
+                    lastServoMoveTime = millis();
+                 }
+              }
+            }
+            else if (content.startsWith("SET_POS:")) {
+              int sIdx = content.indexOf(';');
+              int i = content.substring(8, sIdx).toInt();
+              int ang = content.substring(sIdx + 1).toInt();
+              
+              if (i >= 0 && i < 6) {
+                 servoPositions[i] = constrain(ang, 50, 180);
+              }
+            }
+            else if (content.startsWith("BRIGHTNESS:")) {
+                ledBrightness = constrain(content.substring(11).toInt(), 0, 255);
+                rgbLeds.setBrightness(ledBrightness);
+                rgbLeds.show();
+            }
+            else if (content.startsWith("LIGHTS:")) {
+                int state = content.substring(7).toInt();
+                digitalWrite(powerLightsPin, state == 1 ? HIGH : LOW);
+            }
+          } else {
+            sendSecure("NACK:BAD_CS");
+          }
+        }
+      }
+      serialInputString = ""; 
+    } else {
+      if (serialInputString.length() < 64) serialInputString += inChar;
+      else serialInputString = "";
+    }
+  }
+}
+
+bool allSensorsEmpty() { for (int i = 0; i < 6; i++) if (sensorsState[i]) return false; return true; }
+
+// Logika RGB podsvícení
+void updateLeds() {
+  static unsigned long lastLedUpdate = 0;
+  if (millis() - lastLedUpdate < 40) return; 
+  lastLedUpdate = millis();
+// Chybové stavy
+  if (currentState == ESTOP || currentState == ERROR_NO_CONN) {
+    static unsigned long lastBlinkTime = 0;
+    static bool isLedOn = false;
+    
+    if (millis() - lastBlinkTime > 200) {
+        lastBlinkTime = millis(); 
+        isLedOn = !isLedOn;       
+        
+        if (isLedOn) {
+            for (int i = 0; i < 6; i++) rgbLeds.setPixelColor(i, rgbLeds.Color(255,0, 0));
+        } else {
+            for (int i = 0; i < 6; i++) rgbLeds.setPixelColor(i, 0); 
+        }
+        rgbLeds.show();
+    }
+    return; 
+  }
+  // Režim výplachu
+  if (currentState == FLUSHING || flushingActive) {
+      for (int i = 0; i < 6; i++) rgbLeds.setPixelColor(i, rgbLeds.Color(255, 100, 20));
+      rgbLeds.show(); return; 
+  }
+// Normální provoz
+  for (int i = 0; i < 6; i++) {
+      if (currentState == RUNNING_SEQUENCE && i == currentPumpIndex && seqState == SEQ_PUMPING) continue;
+      
+      if (alreadyPumped[i]) rgbLeds.setPixelColor(i, rgbLeds.Color(0, 255, 0)); 
+      else if (sensorsState[i]) rgbLeds.setPixelColor(i, rgbLeds.Color(255, 0, 0)); 
+      else rgbLeds.setPixelColor(i, rgbLeds.Color(0, 0, 255)); 
+  }
+  rgbLeds.show();
+}
+
+//HANDLERY STAVŮ 
+void handleCalibrationCheckState() {
+    switch (calibSubState) {
+        case CALIB_MOVE_TO_TARGET:
+            if (processServoMove(calibTargetAngle)) {
+                waitStartTime = millis();
+                calibSubState = CALIB_WAIT;
+            }
+            break;
+        case CALIB_WAIT:
+            if (millis() - waitStartTime >= 2000) {
+                calibSubState = CALIB_RETURN_HOME;
+            }
+            break;
+        case CALIB_RETURN_HOME:
+            if (processServoMove(servoRestPosition)) {
+                servo.detach(); 
+                currentState = IDLE; 
+            }
+            break;
+    }
+}
+
+void handleHomingState() {
+    if (!servo.attached()) {
+        servo.write(servoRestPosition);
+        servo.attach(servoPin);
+        currentServoPosition = servoRestPosition; 
+        waitStartTime = millis(); 
+    }
+
+    if (millis() - waitStartTime >= 2500) {
+        servo.detach();      
+        currentState = IDLE; 
+    }
+}
+
+// Hlavní dávkovací sekvence
+void handleRunningSequenceState() {
+  wdt_reset();
+  switch (seqState) {
+    case SEQ_FIND_NEXT:
+      currentPumpIndex = -1;
+      for (int i = 0; i < 6; i++) {
+        if (sensorsState[i] && !alreadyPumped[i]) {
+          currentPumpIndex = i;
+          targetServoPos = servoPositions[i];
+          seqState = SEQ_MOVING_TO_TARGET;
+          waitStartTime = 0;
+          return;
+        }
+      }
+      targetServoPos = servoRestPosition;
+      seqState = SEQ_RETURNING_HOME;
+      waitStartTime = 0;
+      break;
+
+    case SEQ_MOVING_TO_TARGET:
+    // Bezpečnostní check: odebrání sklenice za jízdy
+      if (currentPumpIndex != -1 && !sensorsState[currentPumpIndex]) {
+              seqState = SEQ_FIND_NEXT; 
+              waitStartTime = 0;
+              return;
+      }
+      
+      if (processServoMove(targetServoPos)) {
+          if (waitStartTime == 0) waitStartTime = millis();
+          
+          if (millis() - waitStartTime >= 1200) {
+              servo.detach(); 
+              pumpStartTime = millis(); 
+              seqState = SEQ_PUMPING;
+              waitStartTime = 0;
+          }
+      } else {
+          waitStartTime = 0;
+      }
+      break;
+
+    case SEQ_PUMPING:
+      {
+        unsigned long elapsed = millis() - pumpStartTime;
+        // Zastavení čerpadla při nečekaném odebrání sklenice
+        if (currentPumpIndex != -1 && !sensorsState[currentPumpIndex]) {
+              analogWrite(pumpPin, 0); 
+              servo.write(currentServoPosition); 
+              servo.attach(servoPin); 
+              seqState = SEQ_FIND_NEXT; 
+              return;
+        }
+      // Dopředné řízení - čerpadlo běží přesně stanovený čas
+        if (elapsed < nextPumpDuration) {
+          analogWrite(pumpPin, PUMP_PWM); 
+          float progress = (float)elapsed / nextPumpDuration;
+          rgbLeds.setPixelColor(currentPumpIndex, rgbLeds.Color(255 * (1 - progress), 255, 0)); 
+          rgbLeds.show();
+        } else {
+          analogWrite(pumpPin, 0); // Konec dávky
+          alreadyPumped[currentPumpIndex] = true;
+          
+          servo.write(currentServoPosition);
+          servo.attach(servoPin); 
+          
+          waitStartTime = millis();
+          seqState = SEQ_WAIT_AFTER;
+        }
+      }
+      break;
+// Odkapavani kapaliny
+    case SEQ_WAIT_AFTER:
+      if (millis() - waitStartTime >= 700) {
+        seqState = SEQ_FIND_NEXT;
+      }
+      break;
+
+    case SEQ_RETURNING_HOME:
+      if (processServoMove(targetServoPos)) {
+         if (waitStartTime == 0) waitStartTime = millis();
+         
+         if (millis() - waitStartTime >= 2000) {
+             servo.detach();
+             currentState = IDLE;
+             seqState = SEQ_FIND_NEXT; 
+             waitStartTime = 0;
+         }
+      } else {
+          waitStartTime = 0;
+      }
+      break;
+  }
+}
+
+void handleIdleState() {
+  if (virtualMainButtonState == LOW && lastVirtualMainButtonState == HIGH) {
+    if (!allSensorsEmpty()) {
+      currentPumpIndex = -1; 
+      seqState = SEQ_FIND_NEXT; 
+      currentState = RUNNING_SEQUENCE; 
+    }
+  }
+  lastVirtualMainButtonState = virtualMainButtonState;
+  // Reset logiky pro odebrané sklenice
+  for (int i = 0; i < 6; i++) {
+    if (!sensorsState[i] && alreadyPumped[i]) { wasRemoved[i] = true; alreadyPumped[i] = false; }
+    else if (sensorsState[i] && wasRemoved[i]) { alreadyPumped[i] = false; wasRemoved[i] = false; }
+  }
+}
+
+void handleFlushingState() {
+  wdt_reset();
+  flushingActive = true; 
+  switch (flushSubState) {
+    case FLUSH_INIT:
+      targetServoPos = 50;
+      flushSubState = FLUSH_MOVING_TO_DRAIN;
+      break;
+    case FLUSH_MOVING_TO_DRAIN:
+      if (processServoMove(targetServoPos)) {
+          flushSubState = FLUSH_PUMPING;
+      }
+      break;
+    case FLUSH_PUMPING:
+      analogWrite(pumpPin, 255); 
+      if (virtualFlushButtonState == HIGH) {
+        analogWrite(pumpPin, 0); 
+        waitStartTime = millis();
+        flushSubState = FLUSH_WAIT_AFTER;
+      }
+      break;
+    case FLUSH_WAIT_AFTER:
+      if (millis() - waitStartTime >= 1000) {
+        targetServoPos = servoRestPosition;
+        flushSubState = FLUSH_MOVING_HOME;
+      }
+      break;
+    case FLUSH_MOVING_HOME:
+      if (processServoMove(targetServoPos)) {
+          servo.detach();
+          flushingActive = false; 
+          flushSubState = FLUSH_INIT; 
+          currentState = IDLE;
+      }
+      break;
+  }
+}
+//SETUP a MAIN LOOP
+void setup() {
+  wdt_disable(); 
+  Serial.begin(115200);
+  setup38kHz(); 
+
+  pinMode(estopPin, INPUT_PULLUP);
+  estopTriggered = (digitalRead(estopPin) == LOW);
+    if (estopTriggered) currentState = ESTOP;
+
+    // Přerušení pro okamžitou reakci na hřib E-STOP
+  attachInterrupt(digitalPinToInterrupt(estopPin), handleEstop, CHANGE);
+
+  serialInputString.reserve(64);
+  pinMode(powerLightsPin, OUTPUT);
+  digitalWrite(powerLightsPin, LOW);
+  pinMode(pumpPin, OUTPUT);
+  pinMode(orangeLedPin, OUTPUT);
+  digitalWrite(orangeLedPin, LOW);
+  for (int i = 0; i < 6; i++) pinMode(irSensors[i], INPUT_PULLUP);
+
+  rgbLeds.begin();
+  rgbLeds.setBrightness(ledBrightness); 
+  rgbLeds.show();
+
+  currentState = SYSTEM_HOMING;
+  
+  wdt_enable(WDTO_4S);  
+}
+
+void loop() {
+  wdt_reset(); 
+  if (estopIRQ) {
+    estopIRQ = false;
+    estopTriggered = (digitalRead(estopPin) == LOW);
+  }
+
+  if (estopTriggered) {
+      currentState = ESTOP;
+      emergencyStop();
+      updateLeds(); 
+      reportStatusUpdates();
+      handleSerialInput(); 
+      return; 
+  } else if (currentState == ESTOP) {
+      currentState = SYSTEM_HOMING;
+  }
+
+  handleSerialInput(); 
+
+  if (millis() - lastSerialTime > COMM_TIMEOUT && isConnected) {
+    emergencyStop();
+    isConnected = false;
+    currentState = ERROR_NO_CONN;
+  }
+  
+  for (int i = 0; i < 6; i++) {
+    bool physicalState = (digitalRead(irSensors[i]) == LOW);
+    if (physicalState) {
+      if (sensorCounters[i] < detectionThreshold) sensorCounters[i]++;
+      if (sensorCounters[i] >= detectionThreshold) sensorsState[i] = true; 
+    } else {
+      if (sensorCounters[i] > 0) sensorCounters[i]--;
+      if (sensorCounters[i] == 0) sensorsState[i] = false; 
+    }
+  }
+
+  reportStatusUpdates(); 
+  // blikání majáku
+  if (currentState != RUNNING_SEQUENCE && currentState != ESTOP && currentState != SYSTEM_HOMING && currentState != CALIBRATION_CHECK) {
+      unsigned long now = millis();
+      static unsigned long lastMajak = 0;
+      static int majakStep = 0;
+      switch (majakStep) {
+        case 0: digitalWrite(orangeLedPin, HIGH); if (now - lastMajak >= 200) { lastMajak = now; majakStep = 1; } break;
+        case 1: digitalWrite(orangeLedPin, LOW); if (now - lastMajak >= 200) { lastMajak = now; majakStep = 2; } break;
+        case 2: digitalWrite(orangeLedPin, HIGH); if (now - lastMajak >= 200) { lastMajak = now; majakStep = 3; } break;
+        case 3: digitalWrite(orangeLedPin, LOW); if (now - lastMajak >= 200) { lastMajak = now; majakStep = 4; } break;
+        case 4:
+          digitalWrite(orangeLedPin, LOW);
+          
+          long pauza = map(nextPumpDuration, 500, 3000, 1200, 200);
+          pauza = constrain(pauza, 200, 1200); 
+          
+          if (now - lastMajak >= pauza) { 
+              lastMajak = now; 
+              majakStep = 0; 
+          }
+          break;
+      }
+  } else if (currentState == RUNNING_SEQUENCE || currentState == SYSTEM_HOMING || currentState == CALIBRATION_CHECK) {
+      digitalWrite(orangeLedPin, HIGH);
+  } else {
+      digitalWrite(orangeLedPin, LOW);
+  }
+
+// Spuštění proplachu přes HMI
+  if (virtualFlushButtonState == LOW && currentState == IDLE) {
+      currentState = FLUSHING;
+  }
+
+// Exekuce stavového automatu
+  switch (currentState) {
+    case IDLE: handleIdleState(); break;
+    case RUNNING_SEQUENCE: handleRunningSequenceState(); break;
+    case FLUSHING: handleFlushingState(); break;
+    case SYSTEM_HOMING: handleHomingState(); break;
+    case CALIBRATION_CHECK: handleCalibrationCheckState(); break; 
+    case ERROR_NO_CONN: break;
+  }
+
+  updateLeds();
+}

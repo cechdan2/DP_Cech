@@ -1,383 +1,601 @@
-# app.py
 from flask import Flask, render_template, request, jsonify
+from flasgger import Swagger
 import serial
+import serial.tools.list_ports
 import threading
 import time
-import json
 import os
 import subprocess
 import sqlite3
-from datetime import datetime, date
+import numpy as np
+import logging
 
-# --- KONFIGURACE ---
-# Na Raspberry Pi to bude pravděpodobně '/dev/ttyUSB0' nebo '/dev/ttyACM0'
-# Na Windows 'COM8'
-SERIAL_PORT = 'COM8' if os.name == 'nt' else '/dev/ttyUSB0'
-BAUD_RATE = 9600
-SERIAL_TIMEOUT = 1
-STATS_FILE = 'stats.json'
-CALIB_FILE = 'calibration.json'
+#KONFIGURACE
+SERIAL_PORT = 'COM5' if os.name == 'nt' else '/dev/ttyUSB0'
+BAUD_RATE = 115200
 DB_FILE = 'logs.db'
+FAN_PIN = 27 # Pin pro MOSFET ventilátoru
 
-# GPIO KONFIGURACE (MOSFET)
-MOSFET_PIN = 27  # Pin, kam je připojen Gate MOSFETu (BCM číslování)
 
-# Nastavení pumpy
-PUMP_TIME_MIN = 1300
-PUMP_TIME_MAX = 4000
-BASE_FLOW_RATE = 0.03
-
-# Barvy pro grafy a nastavení faktorů
-ALCOHOL_CONFIG = {
-    'VODKA': {'name': 'Vodka / Rum', 'factor': 1.0, 'color': '#3498db'},
-    'JAGER': {'name': 'Jägermeister', 'factor': 0.75, 'color': '#e67e22'}, 
-    'LIQUEUR': {'name': 'Vaječný likér', 'factor': 0.6, 'color': '#f1c40f'},
-    'WATER': {'name': 'Voda (Test)', 'factor': 1.05, 'color': '#2ecc71'}
-}
-
+# Výchozí polohy serva
 DEFAULT_POSITIONS = [157, 141, 125, 104, 87, 68]
 
+# GLOBÁLNÍ PROMĚNNÉ
 app = Flask(__name__)
 
-# --- HARDWARE SETUP (GPIO) ---
+# Konfigurace Swagger dokumentace
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec',
+            "route": '/apispec.json',
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/apidocs/"
+}
+swagger = Swagger(app, config=swagger_config, template={
+    "info": {
+        "title": "Masters Thesis API",
+        "description": "API pro řízení a monitorování automatického dávkovače alkoholu",
+        "version": "1.2.0"
+    }
+})
+
+ser = None
+
+# ZÁMKY PRO VLÁKNA
+db_lock = threading.Lock()      
+serial_lock = threading.Lock()  
+
+# Globální proměnná pro Lookup Table (LUT) - formát: [objem_ml, cas_ms]
+LUT_DATA = None 
+
+system_state = {'SYSTEM': 'DISCONNECTED', 'lights_on': False}
+sensor_states = {str(i): {'SENSOR': 'OFF', 'DOSE': 'IDLE'} for i in range(6)}
+virtual_inputs = {'BUTTON_MAIN': 0, 'BUTTON_FLUSH': 0, 'TARGET_ML': 40}
+
+app_start_time = time.time()
+last_save_time = time.time()
+
+stats = {
+    'session_glasses': 0, 'total_glasses': 0,
+    'total_volume_ml': 0.0, 'total_runtime_sec': 0,
+    'led_brightness': 200,
+    'lights_on': False
+}
+calibration_data = list(DEFAULT_POSITIONS)
+
+# PROMĚNNÉ PRO RETRY MECHANISMUS A CHYBY
+pending_command = None
+retry_count = 0
+last_command_time = 0
+MAX_RETRIES = 3
+RETRY_TIMEOUT = 0.2
+
+system_errors = [] 
+
+def report_error(error_msg):
+    global system_errors
+    timestamp = time.strftime("%H:%M:%S")
+    full_msg = f"[{timestamp}] {error_msg}"
+    print(f"!!! SYSTEM ERROR: {full_msg}")
+    
+    system_errors.append(full_msg)
+    if len(system_errors) > 5: 
+        system_errors.pop(0)
+
+# HARDWARE SETUP (RPi GPIO)
 GPIO_AVAILABLE = False
+fan_active = False # Stavová proměnná pro hysterezi ventilátoru
+
 try:
     import RPi.GPIO as GPIO
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-    GPIO.setup(MOSFET_PIN, GPIO.OUT)
-    GPIO.output(MOSFET_PIN, GPIO.LOW) # Výchozí stav: vypnuto
+    GPIO.setup(FAN_PIN, GPIO.OUT)
+    GPIO.output(FAN_PIN, GPIO.LOW)
     GPIO_AVAILABLE = True
-    print(f"GPIO {MOSFET_PIN} inicializováno pro MOSFET.")
-except ImportError:
-    print("Knihovna RPi.GPIO nenalezena (běžíte na PC?), simuluji GPIO.")
-except Exception as e:
-    print(f"Chyba GPIO: {e}")
+except: pass
 
-# --- GLOBÁLNÍ PROMĚNNÉ ---
-# Přidáno 'lights_on' do stavu systému
-system_state = {'SYSTEM': 'IDLE', 'lights_on': False} 
-sensor_states = {str(i): {'SENSOR': 'OFF', 'DOSE': 'IDLE'} for i in range(6)}
-virtual_inputs = {'BUTTON_MAIN': 0, 'BUTTON_FLUSH': 0, 'POT_VAL': 512}
-current_alcohol_key = 'VODKA'
-new_record_flag = False 
-
-# Tachometr stroje
-stats = {
-    'session_shots': 0,
-    'total_shots': 0,
-    'total_volume_ml': 0.0,
-    'total_runtime_sec': 0
-}
-
-app_start_time = time.time()
-last_save_time = time.time()
-calibration_data = list(DEFAULT_POSITIONS)
-
-# --- PRÁCE S DATABÁZÍ (SQLITE) ---
+#  DATABÁZE
 def init_db():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                event_type TEXT,
-                volume_ml REAL,
-                details TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    except Exception as e: print(f"Chyba DB: {e}")
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, event_type TEXT, volume_ml REAL, details TEXT)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS machine_stats (id INTEGER PRIMARY KEY CHECK (id = 1), total_glasses INTEGER DEFAULT 0, total_volume_ml REAL DEFAULT 0.0, total_runtime_sec INTEGER DEFAULT 0, led_brightness INTEGER DEFAULT 200)''')
+            c.execute("INSERT OR IGNORE INTO machine_stats (id) VALUES (1)")
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS servo_calibration (position_index INTEGER PRIMARY KEY, angle INTEGER NOT NULL)''')
+            c.execute("SELECT COUNT(*) FROM servo_calibration")
+            if c.fetchone()[0] == 0:
+                for i, angle in enumerate(DEFAULT_POSITIONS):
+                    c.execute("INSERT INTO servo_calibration (position_index, angle) VALUES (?, ?)", (i, angle))
+            
+            # NOVÁ STRUKTURA KALIBRAČNÍ TABULKY (Objem -> Čas)
+            c.execute('''CREATE TABLE IF NOT EXISTS volume_calibration (
+                        volume_ml REAL PRIMARY KEY, 
+                        duration_ms INTEGER NOT NULL)''')
+            
+            c.execute("SELECT COUNT(*) FROM volume_calibration")
+            if c.fetchone()[0] == 0:
+                
+                defaults = [
+                    (1.85, 50), (2.41, 100), (4.00, 150), (4.44, 200), (5.50, 250),
+                    (6.67, 300), (7.41, 350), (8.52, 400), (9.24, 450), (10.31, 500),
+                    (11.15, 550), (11.89, 600), (12.46, 650), (13.52, 700), (14.09, 750),
+                    (15.33, 800), (16.63, 850), (17.59, 900), (18.56, 950), (19.61, 1000),
+                    (20.61, 1050), (21.41, 1100), (22.26, 1150), (23.43, 1200), (24.13, 1250),
+                    (24.46, 1300), (25.09, 1350), (25.41, 1400), (27.46, 1450), (28.43, 1500),
+                    (29.15, 1550), (30.30, 1600), (31.39, 1650), (32.28, 1700), (33.53, 1750),
+                    (34.93, 1800), (35.63, 1850), (36.79, 1900), (38.49, 1950), (39.51, 2000), (39.6, 2050), (39.8, 2100), (40.1, 2150)
+                ]
+                c.executemany("INSERT INTO volume_calibration (volume_ml, duration_ms) VALUES (?, ?)", defaults)
+
+            conn.commit()
+            conn.close()
+        except Exception as e: 
+            report_error(f"DB Init Error: {e}")
+
+def load_all_data_from_db():
+    global stats, calibration_data, LUT_DATA
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            
+            c.execute("SELECT total_glasses, total_volume_ml, total_runtime_sec, led_brightness FROM machine_stats WHERE id=1")
+            row = c.fetchone()
+            if row:
+                stats['total_glasses'], stats['total_volume_ml'], stats['total_runtime_sec'], stats['led_brightness'] = row
+            
+            c.execute("SELECT COUNT(*) FROM logs WHERE event_type='GLASS' AND date(timestamp) = date('now')")
+            stats['session_glasses'] = c.fetchone()[0]
+
+            c.execute("SELECT position_index, angle FROM servo_calibration ORDER BY position_index ASC")
+            rows = c.fetchall()
+            if rows:
+                db_list = [r[1] for r in rows]
+                calibration_data[:] = (db_list + DEFAULT_POSITIONS[len(db_list):])[:6]
+            
+            # Načtení objemové kalibrace
+            c.execute("SELECT volume_ml, duration_ms FROM volume_calibration ORDER BY volume_ml ASC")
+            rows = c.fetchall()
+            if rows:
+                LUT_DATA = np.array(rows)
+            else:
+                LUT_DATA = np.array([[0.0, 0], [50.0, 3200]])
+
+            conn.close()
+        except Exception as e: 
+            report_error(f"DB Load Error: {e}")
+
+def save_stats_to_db():
+    global app_start_time
+    now = time.time()
+    elapsed = now - app_start_time
+    stats['total_runtime_sec'] += int(elapsed)
+    app_start_time = now
+
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute("UPDATE machine_stats SET total_glasses=?, total_volume_ml=?, total_runtime_sec=?, led_brightness=? WHERE id=1", 
+                         (stats['total_glasses'], stats['total_volume_ml'], stats['total_runtime_sec'], stats['led_brightness']))
+            conn.commit()
+            conn.close()
+        except Exception as e: print(f"DB Save Error: {e}")
 
 def write_log(event_type, volume=0.0, details=""):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO logs (event_type, volume_ml, details) VALUES (?, ?, ?)",
-                  (event_type, volume, details))
-        conn.commit()
-        conn.close()
-    except Exception as e: print(f"Chyba Log: {e}")
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute("INSERT INTO logs (event_type, volume_ml, details) VALUES (?, ?, ?)", (event_type, volume, details))
+            conn.commit()
+            conn.close()
+        except Exception as e: print(f"Log Error: {e}")
 
-# --- SQL STATISTICKÉ FUNKCE ---
-def get_stats_from_db():
-    counts = {}
+def get_rpi_temp():
+    global fan_active
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        for key in ALCOHOL_CONFIG:
-            search_str = f"%Key:{key}%"
-            c.execute("SELECT COUNT(*) FROM logs WHERE event_type='SHOT' AND details LIKE ?", (search_str,))
-            counts[key] = c.fetchone()[0]
-        conn.close()
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            temp_c = int(round(int(f.read()) / 1000.0))
+            if GPIO_AVAILABLE:
+                # Dvoupolohový regulátor s hysterezí
+                if temp_c >= 40 and not fan_active:
+                    GPIO.output(FAN_PIN, GPIO.HIGH)
+                    fan_active = True
+                elif temp_c <= 30 and fan_active:
+                    GPIO.output(FAN_PIN, GPIO.LOW)
+                    fan_active = False
+            return temp_c
     except:
-        for key in ALCOHOL_CONFIG: counts[key] = 0
-    return counts
+        return 0
 
-def get_today_count():
+# VÝPOČET ČASU ČERPÁNÍ 
+def calculate_pump_time(target_ml):
+    global LUT_DATA
+    if LUT_DATA is None or len(LUT_DATA) == 0:
+        return 2000 # Fallback čas
+        
+    volumes = LUT_DATA[:, 0]
+    durations = LUT_DATA[:, 1]
+
+    # np.interp spolehlivě interpoluje na základě dodané empirické tabulky
+    duration_ms = np.interp(target_ml, volumes, durations)
+    
+    return int(duration_ms)
+
+# KOMUNIKACE
+def send_to_arduino(body, is_retry=False):
+    global ser, pending_command, retry_count, last_command_time
+    with serial_lock:
+        if ser and ser.is_open:
+            try:
+                cs = 0
+                for char in body: cs ^= ord(char)
+                msg = f"${body}*{cs:02X}\n"
+                
+                if not is_retry:
+                    pending_command = body
+                    retry_count = 0
+                
+                last_command_time = time.time()
+                print(f"PYTHON >> {msg.strip()} {'(RETRY ' + str(retry_count) + ')' if is_retry else ''}") 
+                ser.write(msg.encode('utf-8'))
+            except Exception as e: 
+                report_error(f"Nelze odeslat data: {e}")
+
+def validate_checksum(line_str):
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM logs WHERE event_type='SHOT' AND date(timestamp, 'localtime') = date('now', 'localtime')")
-        res = c.fetchone()[0]
-        conn.close()
-        return res
-    except: return 0
+        if not line_str.startswith('$') or '*' not in line_str: return None 
+        content, received_cs_hex = line_str[1:].rsplit('*', 1)
+        my_cs = 0
+        for char in content: my_cs ^= ord(char)
+        if my_cs == int(received_cs_hex, 16): return content 
+        return None
+    except: return None
 
-def get_historical_daily_record():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("""
-            SELECT COUNT(*) as cnt 
-            FROM logs 
-            WHERE event_type='SHOT' 
-            GROUP BY date(timestamp, 'localtime') 
-            ORDER BY cnt DESC 
-            LIMIT 1
-        """)
-        res = c.fetchone()
-        conn.close()
-        return res[0] if res else 0
-    except: return 0
-
-# --- LOAD/SAVE JSON ---
-def load_stats():
-    global stats
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, 'r') as f:
-                data = json.load(f)
-                for k in stats.keys():
-                    if k in data: stats[k] = data[k]
-        except: pass
-
-def save_stats():
-    current_runtime = stats['total_runtime_sec'] + (time.time() - app_start_time)
-    data = stats.copy()
-    data['total_runtime_sec'] = int(current_runtime)
-    try:
-        with open(STATS_FILE, 'w') as f: json.dump(data, f)
-    except: pass
-
-def load_calibration():
-    global calibration_data
-    if os.path.exists(CALIB_FILE):
-        try:
-            with open(CALIB_FILE, 'r') as f: calibration_data = json.load(f)
-        except: pass
-
-def save_calibration():
-    try:
-        with open(CALIB_FILE, 'w') as f: json.dump(calibration_data, f)
-    except: pass
-
-load_stats()
-load_calibration()
-init_db()
-
-# --- ARDUINO & LOGIC ---
-def send_to_arduino(command):
-    if ser and ser.is_open:
-        try: ser.write(f"{command}\n".encode('utf-8'))
-        except: pass
-
-def sync_arduino_calibration():
-    time.sleep(3)
+def sync_arduino_settings():
+    time.sleep(3) 
+    
     for i, angle in enumerate(calibration_data):
-        send_to_arduino(f"CALIB:{i};{angle}")
-        time.sleep(0.05)
-
-ser = None
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=SERIAL_TIMEOUT)
-    threading.Thread(target=sync_arduino_calibration, daemon=True).start()
-except: print(f"Arduino nepřipojeno na {SERIAL_PORT}.")
-
-def calculate_real_volume_from_pot():
-    pot = virtual_inputs['POT_VAL']
-    pump_time_ms = PUMP_TIME_MIN + (float(pot) / 1023.0) * (PUMP_TIME_MAX - PUMP_TIME_MIN)
-    factor = ALCOHOL_CONFIG[current_alcohol_key]['factor']
-    return pump_time_ms * (BASE_FLOW_RATE * factor)
+        send_to_arduino(f"SET_POS:{i};{angle}")
+        time.sleep(0.1)
+    send_to_arduino(f"BRIGHTNESS:{stats['led_brightness']}")
 
 def read_from_arduino():
-    global system_state, sensor_states, stats, new_record_flag
-    if ser and ser.in_waiting > 0:
-        try:
-            line = ser.readline().decode('utf-8').strip()
-            if not line: return
-            parts = line.split(';')
-            
-            if parts[0] == 'STATUS:SYSTEM':
-                if len(parts) > 1: system_state['SYSTEM'] = parts[1]
-            
-            elif parts[0] == 'STATUS:SENSOR':
-                if len(parts) >= 3:
-                    idx, state = parts[1], parts[2]
-                    if idx in sensor_states: sensor_states[idx]['SENSOR'] = state
-            
-            elif parts[0] == 'STATUS:DOSE':
-                if len(parts) >= 3:
-                    idx, new_state = parts[1], parts[2]
-                    if idx in sensor_states:
-                        curr = sensor_states[idx]['DOSE']
-                        
-                        # --- DETEKCE ÚSPĚŠNÉHO NAČEPOVÁNÍ ---
-                        if new_state == 'PUMPED' and curr != 'PUMPED':
-                            vol = calculate_real_volume_from_pot()
-                            
-                            stats['session_shots'] += 1
-                            stats['total_shots'] += 1
-                            stats['total_volume_ml'] += vol
-                            
-                            old_record = get_historical_daily_record()
-                            alcohol_name = ALCOHOL_CONFIG[current_alcohol_key]['name']
-                            write_log('SHOT', vol, f"Pos {idx} | {alcohol_name} | Key:{current_alcohol_key}")
-                            
-                            today_count = get_today_count()
-                            if today_count > old_record and today_count > 1:
-                                new_record_flag = True
-                                print(f"!!! NOVÝ REKORD !!! {today_count} panáků")
+    global system_state, sensor_states, stats, ser, pending_command, retry_count
+    with serial_lock:
+        if not ser or not ser.is_open:
+            raise serial.SerialException("Port closed")
 
-                            save_stats()
-                        
-                        sensor_states[idx]['DOSE'] = new_state
-        except: pass
+        if ser.in_waiting > 0:
+            raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+            if not raw_line: return
+            
+            print(f"ARDUINO RAW << {raw_line}")
+            clean_data = validate_checksum(raw_line)
+            if not clean_data:
+                print(f"!!! Checksum Error on: {raw_line}")
+                return
+
+            if clean_data.startswith("ACK:"):
+                acked_cmd = clean_data.split(":")[1]
+                if pending_command and pending_command.startswith(acked_cmd):
+                    print(f"ACK CONFIRMED >> {acked_cmd}")
+                    pending_command = None
+                return
+
+            if clean_data.startswith("NACK:"):
+                error_type = clean_data.split(":")[1] if len(clean_data.split(":")) > 1 else "Neznámá"
+                report_error(f"Arduino zamítlo příkaz (NACK). Důvod: {error_type}")
+                return
+
+            if clean_data.startswith("ERROR:"):
+                msg = clean_data.split(":", 1)[1] if len(clean_data.split(":")) > 1 else "HW Error"
+                report_error(f"HW CHYBA: {msg}")
+                return
+            
+            parts = clean_data.split(';')
+            if parts[0] == 'STATUS:SYSTEM' and len(parts) > 1:
+                new_sys_state = parts[1]
+                if system_state['SYSTEM'] != new_sys_state:
+                    system_state['SYSTEM'] = new_sys_state
+                    print(f"SYSTEM STATE CHANGE: {new_sys_state}")
+                    if new_sys_state == 'ESTOP': write_log('EMERGENCY', 0, 'Hardware E-Stop activated')
+
+            elif parts[0] == 'STATUS:SENSOR' and len(parts) >= 3:
+                idx, state = parts[1], parts[2]
+                if idx in sensor_states: sensor_states[idx]['SENSOR'] = state
+            
+            elif parts[0] == 'STATUS:DOSE' and len(parts) >= 3:
+                idx, new_state = parts[1], parts[2]
+                if idx in sensor_states:
+                    if new_state == 'PUMPED' and sensor_states[idx]['DOSE'] != 'PUMPED':
+                        current_ml_target = virtual_inputs['TARGET_ML']
+                        stats['session_glasses'] += 1
+                        stats['total_glasses'] += 1
+                        stats['total_volume_ml'] += current_ml_target
+                        write_log('GLASS', current_ml_target, f"Pos {idx}")
+                        save_stats_to_db()
+                        print(f"--- GLASS REGISTERED: Pos {idx}, Vol {current_ml_target:.1f}ml ---")
+                    sensor_states[idx]['DOSE'] = new_state
 
 def serial_monitor():
-    global last_save_time
+    global last_save_time, ser, pending_command, retry_count, last_command_time, system_state
+    last_heartbeat = 0
+    last_sent_inputs = {'BUTTON_MAIN': -1, 'BUTTON_FLUSH': -1, 'TARGET_ML': -1}
+
     while True:
-        read_from_arduino()
-        if ser and ser.is_open:
-            send_to_arduino(f"INPUT:BUTTON_MAIN;{virtual_inputs['BUTTON_MAIN']}")
-            send_to_arduino(f"INPUT:BUTTON_FLUSH;{virtual_inputs['BUTTON_FLUSH']}")
-            send_to_arduino(f"INPUT:POT_VAL;{virtual_inputs['POT_VAL']}")
-        
+        if ser is None or not ser.is_open:
+            system_state['SYSTEM'] = 'DISCONNECTED'
+            try:
+                
+                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+                
+                threading.Thread(target=sync_arduino_settings, daemon=True).start()
+            except Exception as e:
+                time.sleep(2)
+                continue
+
+        try:
+            read_from_arduino()
+            
+            if pending_command and (time.time() - last_command_time > RETRY_TIMEOUT):
+                if retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    print(f"TIMEOUT! Re-sending {pending_command}...")
+                    send_to_arduino(pending_command, is_retry=True)
+                else:
+                    report_error(f"Příkaz selhal (timeout): {pending_command}")
+                    with serial_lock:
+                        pending_command = None
+
+            if not pending_command:
+                for key in ['BUTTON_MAIN', 'TARGET_ML']:
+                    if virtual_inputs[key] != last_sent_inputs[key]:
+                        send_to_arduino(f"INPUT:{key};{virtual_inputs[key]}")
+                        last_sent_inputs[key] = virtual_inputs[key]
+                        last_heartbeat = time.time()
+                
+                if virtual_inputs['BUTTON_FLUSH'] != last_sent_inputs['BUTTON_FLUSH']:
+                     send_to_arduino(f"FLUSH:{virtual_inputs['BUTTON_FLUSH']}")
+                     last_sent_inputs['BUTTON_FLUSH'] = virtual_inputs['BUTTON_FLUSH']
+
+                if time.time() - last_heartbeat > 4.0:
+                    send_to_arduino(f"BRIGHTNESS:{stats['led_brightness']}")
+                    last_heartbeat = time.time()
+
+        except Exception as e:
+            report_error(f"Ztráta spojení: {e}")
+            try: 
+                with serial_lock: ser.close()
+            except: pass
+            ser = None
+            system_state['SYSTEM'] = 'DISCONNECTED'
+
         if time.time() - last_save_time > 60:
-            save_stats()
+            save_stats_to_db()
             last_save_time = time.time()
-        time.sleep(0.1)
+            
+        time.sleep(0.005)
 
-threading.Thread(target=serial_monitor, daemon=True).start()
+# API
 
-# --- API ---
 @app.route('/')
-def index(): return render_template('index.html')
+def index(): 
+    """
+    Hlavní uživatelské rozhraní
+    ---
+    tags:
+      - Frontend
+    responses:
+      200:
+        description: Vrátí hlavní HTML stránku webové aplikace
+    """
+    return render_template('index.html')
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
-    global new_record_flag
+    """
+    Kompletní stav stroje
+    ---
+    tags:
+      - Monitoring
+    responses:
+      200:
+        description: JSON objekt se stavem FSM z MCU, senzorů, počítadel a diagnostiky Raspberry Pi
+    """
     rt = stats['total_runtime_sec'] + (time.time() - app_start_time)
-    m, s = divmod(rt, 60); h, m = divmod(m, 60)
+    m, s = divmod(int(rt), 60); h, m = divmod(m, 60)
+    cpu_temp = get_rpi_temp()
     
-    is_new_record = new_record_flag
-    if new_record_flag: new_record_flag = False
-
-    response = {
-        'system': system_state['SYSTEM'],
-        'lights_on': system_state['lights_on'], # Odesíláme stav světel do UI
-        'sensors': sensor_states,
-        'pot_value': virtual_inputs['POT_VAL'],
-        'stats': stats,
-        'today_count': get_today_count(),
-        'new_record': is_new_record,
-        'alcohol': {
-            'current': current_alcohol_key,
-            'config': ALCOHOL_CONFIG
-        },
+    return jsonify({
+        'system': system_state['SYSTEM'], 
+        'lights_on': stats['lights_on'],
+        'sensors': sensor_states, 
+        'target_ml': virtual_inputs['TARGET_ML'],
+        'pump_pwm': HARDCODED_PUMP_PWM,
+        'stats': stats, 
+        'errors': system_errors,
         'display_stats': {
-            'runtime': f"{int(h)}h {int(m)}m",
-            'volume': f"{stats['total_volume_ml']/1000:.1f} L" if stats['total_volume_ml'] > 1000 else f"{int(stats['total_volume_ml'])} ml"
+            'runtime': f"{h}h {m}m", 
+            'volume': f"{int(stats['total_volume_ml'])} ml",
+            'cpu_temp': cpu_temp
         }
-    }
-    return jsonify(response)
+    })
 
 @app.route('/api/control', methods=['POST'])
 def post_control():
-    global virtual_inputs, system_state
+    """
+    Odeslání řídicích příkazů do stroje
+    ---
+    tags:
+      - Ovládání
+    parameters:
+      - in: body
+        name: body
+        description: JSON objekt s požadovanou akcí a případnou hodnotou
+        required: true
+        schema:
+          type: object
+          properties:
+            action:
+              type: string
+              example: target_ml_set
+            value:
+              type: integer
+              example: 40
+    responses:
+      200:
+        description: Příkaz úspěšně přijat, přeložen do UART rámce a odeslán
+    """
+    global virtual_inputs, stats
     data = request.json
     act, val = data.get('action'), data.get('value')
     
-    # --- OVLÁDÁNÍ MOSFETU (SVĚTLA) ---
     if act == 'lights_toggle':
-        # Přepnutí stavu v paměti
-        system_state['lights_on'] = not system_state['lights_on']
-        
-        # Fyzické přepnutí pinu (pokud jsme na RPi)
-        if GPIO_AVAILABLE:
-            if system_state['lights_on']:
-                GPIO.output(MOSFET_PIN, GPIO.HIGH)
-            else:
-                GPIO.output(MOSFET_PIN, GPIO.LOW)
-        print(f"Světla: {system_state['lights_on']}")
-
-    # --- OSTATNÍ OVLÁDÁNÍ ---
+        stats['lights_on'] = not stats['lights_on']
+        send_to_arduino(f"LIGHTS:{1 if stats['lights_on'] else 0}")
     elif act == 'main_down': virtual_inputs['BUTTON_MAIN'] = 1
     elif act == 'main_up': virtual_inputs['BUTTON_MAIN'] = 0
     elif act == 'flush_down': virtual_inputs['BUTTON_FLUSH'] = 1
     elif act == 'flush_up': virtual_inputs['BUTTON_FLUSH'] = 0
-    elif act == 'pot_set':
-        if val is not None: virtual_inputs['POT_VAL'] = int(val)
-        
-    return jsonify({'status': 'ok'})
+    elif act == 'target_ml_set':
+        if val is not None: 
+            target_ml = int(val)
+            virtual_inputs['TARGET_ML'] = target_ml
+            
+            # Zjistí čas z LUT tabulky a pošle čistě jen milisekundy
+            duration_ms = calculate_pump_time(target_ml)
+            send_to_arduino(f"PUMP:{duration_ms}")
 
-@app.route('/api/settings/alcohol', methods=['POST'])
-def set_alcohol():
-    global current_alcohol_key
-    key = request.json.get('key')
-    if key in ALCOHOL_CONFIG:
-        current_alcohol_key = key
-        return jsonify({'status': 'ok', 'name': ALCOHOL_CONFIG[key]['name']})
-    return jsonify({'error': 'Unknown type'}), 400
+    return jsonify({'status': 'ok'})
 
 @app.route('/api/calibration', methods=['GET', 'POST'])
 def calib():
-    global calibration_data
+    """
+    Čtení a zápis kalibrace
+    ---
+    tags:
+      - Kalibrace
+    parameters:
+      - in: body
+        name: body
+        required: false
+        schema:
+          type: object
+          properties:
+            index:
+              type: integer
+              description: Index zásobníku (0-5)
+              example: 2
+            angle:
+              type: integer
+              description: Pracovní úhel servomotoru
+              example: 125
+    responses:
+      200:
+        description: Vrací aktuální pole 6 úhlů nebo potvrzuje uložení nové polohy do SQLite
+    """
     if request.method == 'POST':
         i, a = int(request.json['index']), int(request.json['angle'])
         calibration_data[i] = a
-        save_calibration()
+        with db_lock:
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("INSERT OR REPLACE INTO servo_calibration (position_index, angle) VALUES (?, ?)", (i, a))
+                conn.commit(); conn.close()
+            except Exception as e:
+                report_error(f"DB Chyba ukládání polohy: {e}")
         send_to_arduino(f"CALIB:{i};{a}")
         return jsonify({'status': 'ok'})
     return jsonify(calibration_data)
 
-@app.route('/api/history', methods=['GET'])
-def hist():
-    try:
-        conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 100").fetchall()
-        conn.close()
-        return jsonify([dict(r) for r in rows])
-    except Exception as e: return jsonify({'error': str(e)}), 500
+@app.route('/api/settings/brightness', methods=['POST'])
+def set_brightness():
+    """
+    Nastavení intenzity osvětlení
+    ---
+    tags:
+      - Nastavení
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            value:
+              type: integer
+              description: PWM hodnota jasu (0-255)
+              example: 200
+    responses:
+      200:
+        description: Jas byl úspěšně upraven a uložen do databáze
+    """
+    val = int(request.json['value'])
+    stats['led_brightness'] = val
+    save_stats_to_db()
+    send_to_arduino(f"BRIGHTNESS:{val}")
+    return jsonify({'status': 'ok'})
 
-@app.route('/api/stats/chart', methods=['GET'])
-def get_chart_data():
-    counts_from_db = get_stats_from_db()
-    daily_record = get_historical_daily_record()
-    return jsonify({
-        'counts': counts_from_db,
-        'config': ALCOHOL_CONFIG,
-        'total': stats['total_shots'],
-        'daily_record': daily_record
-    })
+@app.route('/api/system/exit_kiosk', methods=['POST'])
+def exit_kiosk():
+    """
+    Ukončení Kiosk režimu displeje
+    ---
+    tags:
+      - Systém
+    responses:
+      200:
+        description: Proces prohlížeče Chromium byl na Raspberry Pi úspěšně ukončen
+      500:
+        description: Selhání při ukončování systémového procesu
+    """
+    try:
+        if os.name != 'nt':
+            subprocess.run(['pkill', '-f', 'chromium'], check=False)
+        return jsonify({'status': 'ok', 'msg': 'Kiosk režim ukončen.'})
+    except Exception as e:
+        report_error(f"Chyba při ukončování Kiosk režimu: {str(e)}")
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
 
 @app.route('/api/system/shutdown', methods=['POST'])
 def shutdown():
-    save_stats()
-    write_log('SYSTEM', 0, 'Shutdown')
-    if GPIO_AVAILABLE:
-        GPIO.cleanup() # Úklid pinů před vypnutím
+    """
+    Bezpečné vypnutí řídicího počítače
+    ---
+    tags:
+      - Systém
+    responses:
+      200:
+        description: Databáze bezpečně uzavřena, GPIO vyčištěno a systém se vypíná
+    """
+    save_stats_to_db()
+    if GPIO_AVAILABLE: GPIO.cleanup()
     if os.name != 'nt': subprocess.run(['sudo', 'shutdown', 'now'])
     return jsonify({'status': 'ok'})
 
 if __name__ == '__main__':
-    write_log('SYSTEM', 0, 'Startup')
-    try:
-        # Použijte 0.0.0.0 aby to bylo vidět na síti
-        app.run(host='0.0.0.0', port=5000)
-    finally:
-        if GPIO_AVAILABLE:
-            GPIO.cleanup()
+    init_db()
+    load_all_data_from_db()
+
+    # --- POTLAČENÍ VÝPISŮ FLASK / WERKZEUG ---
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.logger.setLevel(logging.ERROR) 
+
+
+    monitor_thread = threading.Thread(target=serial_monitor, daemon=True)
+    monitor_thread.start()
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)

@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>JD Harvest Control</title>
+    <title>Diplomová práce</title>
     <style>
+        /* Základní paleta a styly */
         :root {
             --jd-green: #367C2B;
             --jd-yellow: #FFDE00;
@@ -14,28 +15,31 @@
             --text-main: #ffffff;
             --text-muted: #cccccc;
             --gap-size: 4px;
+            --vh: 1vh;
         }
 
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; touch-action: manipulation; }
 
         body { 
             font-family: 'Roboto Condensed', 'Segoe UI', sans-serif; 
             background-color: #000; 
             color: var(--text-main); 
-            margin: 0; padding: 0; height: 100vh; width: 100vw; 
+            margin: 0; 
+            padding: 0;
+            height: calc(var(--vh, 1vh) * 100); 
+            width: 100vw; 
             overflow: hidden; display: flex; flex-direction: column; 
         }
 
         /* TOP BAR */
         .top-bar {
-            height: 40px; background-color: var(--jd-green); color: white;
+            height: 50px; background-color: var(--jd-green); color: white;
             display: flex; align-items: center; justify-content: space-between;
             padding: 0 15px; border-bottom: 2px solid var(--jd-yellow); flex-shrink: 0;
         }
         .top-bar h1 { margin: 0; font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
-        .settings-icon { font-size: 1.2rem; cursor: pointer; padding: 5px; transition: transform 0.2s; }
+        .settings-icon { font-size: 1.8rem; cursor: pointer; padding: 5px; transition: transform 0.2s; }
         .settings-icon:active { transform: rotate(90deg); }
-        .clock { font-weight: bold; font-size: 1.1rem; }
 
         /* DASHBOARD LAYOUT */
         .dashboard {
@@ -46,7 +50,7 @@
             background-color: #111;
         }
 
-        .col-panel { display: flex; flex-direction: column; gap: var(--gap-size); height: 100%; }
+        .col-panel { display: flex; flex-direction: column; gap: var(--gap-size); height: 100%; min-height: 0; }
         
         .widget {
             background-color: var(--panel-bg); border: 1px solid var(--border-color);
@@ -61,8 +65,7 @@
             display: flex; justify-content: space-between;
         }
         .w-header.green { background: var(--jd-green); color: white; }
-
-        .w-body { flex: 1; padding: 8px; display: flex; flex-direction: column; justify-content: center; }
+        .w-body { flex: 1; padding: 8px; display: flex; flex-direction: column; justify-content: center; min-height: 0; }
 
         /* STATS ROWS */
         .stat-row {
@@ -91,11 +94,14 @@
         }
         .S-ON .s-fill { height: 100%; opacity: 0.2; }
         .S-ON .s-status { color: #fff; }
-        .D-READY .s-fill { background-color: var(--jd-yellow); opacity: 0.5; height: 50%; }
+        .D-READY .s-fill { background-color: green; opacity: 0.5; height: 50%; }
         .D-READY .s-status { color: var(--jd-yellow); }
         .D-PUMPED { border: 2px solid var(--jd-green); background: #1b3e20; }
         .D-PUMPED .s-fill { height: 100%; background-color: var(--jd-green); opacity: 1; }
         .D-PUMPED .s-status { color: white; text-shadow: 0 1px 2px black; }
+        .F-FLUSHING { border: 2px solid #ff9800; background: #4e342e; }
+        .F-FLUSHING .s-fill { height: 100%; background-color: #ff9800; opacity: 0.6; }
+        .F-FLUSHING .s-status { color: white; text-shadow: 0 1px 2px black; }
 
         /* CONTROLS */
         .control-grid { display: grid; grid-template-rows: repeat(4, 1fr); gap: 6px; height: 100%; }
@@ -104,12 +110,14 @@
             color: white; font-weight: bold; text-transform: uppercase; font-size: 1rem;
             border-radius: 4px; cursor: pointer; position: relative;
             box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            user-select: none;
         }
-        button:active { top: 2px; box-shadow: none; }
+        button:active { top: 2px; box-shadow: none; background: #444; }
         button span { display: block; font-size: 0.7rem; opacity: 0.7; margin-top: 2px; }
         .btn-start { background: linear-gradient(180deg, #4caf50, #2e7d32); border-color: #2e7d32; }
         .btn-flush { background: linear-gradient(180deg, #ffeb3b, #fbc02d); color: black; border-color: #f9a825; }
         .btn-stop  { background: linear-gradient(180deg, #f44336, #c62828); border-color: #b71c1c; }
+        .lights-active { background: linear-gradient(180deg, #ff9800, #e65100) !important; color: white !important; border-color: #e65100 !important; }
 
         /* DOSE WIDGET */
         .dose-widget-container { display: flex; align-items: center; justify-content: space-between; height: 100%; padding: 5px 0; }
@@ -129,19 +137,65 @@
         }
         .modal-content {
             background-color: #222; border: 2px solid var(--jd-yellow);
-            padding: 20px; border-radius: 4px; width: 95%; max-width: 600px;
+            padding: 15px; border-radius: 4px; width: 95%; max-width: 750px;
+            max-height: 95vh; overflow-y: auto;
             color: white; box-shadow: 0 0 20px rgba(0,0,0,0.7);
         }
-        .close-btn { background: #444; border: 1px solid #666; width: 100%; margin-top: 20px; padding: 15px; color: white; font-weight: bold; cursor: pointer; }
+        .close-btn { background: #444; border: 1px solid #666; width: 100%; margin-top: 10px; padding: 10px; color: white; font-weight: bold; cursor: pointer; }
         
-        /* CALIBRATION SPECIFIC */
-        .calib-list { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-        .calib-row { display: flex; flex-direction: column; background: #333; padding: 10px; border: 1px solid #444; }
-        input[type=range] { width: 100%; margin: 5px 0; -webkit-appearance: none; background: transparent; }
-        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #555; border-radius: 4px; }
-        input[type=range]::-webkit-slider-thumb { height: 20px; width: 20px; border-radius: 50%; background: var(--jd-yellow); cursor: pointer; -webkit-appearance: none; margin-top: -6px; }
+        /* KALIBRACE  */
+        .calib-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        
+        .calib-row { 
+            display: flex; 
+            flex-direction: column; 
+            background: #333; 
+            padding: 10px; 
+            border: 1px solid #444; 
+            border-radius: 4px;
+        }
 
-        /* PIN KEYPAD SPECIFIC */
+        input[type=range] { 
+            width: 100%; 
+            margin: 10px 0 5px 0; 
+            -webkit-appearance: none; 
+            background: transparent; 
+            height: 35px; 
+            touch-action: pan-y;
+        }
+        input[type=range]::-webkit-slider-runnable-track { 
+            width: 100%; 
+            height: 12px; 
+            cursor: pointer; 
+            background: #555; 
+            border-radius: 6px; 
+        }
+        input[type=range]::-webkit-slider-thumb { 
+            height: 40px; 
+            width: 40px; 
+            border-radius: 50%; 
+            background: var(--jd-yellow); 
+            cursor: pointer; 
+            -webkit-appearance: none; 
+            margin-top: -14px; 
+            border: 2px solid #333;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.6);
+        }
+        input[type=range]::-moz-range-track {
+            height: 12px;
+            background: #555;
+            border-radius: 6px;
+        }
+        input[type=range]::-moz-range-thumb {
+            height: 40px;
+            width: 40px;
+            border-radius: 50%;
+            background: var(--jd-yellow);
+            border: 2px solid #333;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.6);
+            cursor: pointer;
+        }
+
         .pin-display {
             background: #000; color: var(--jd-yellow); font-size: 2rem; text-align: center; 
             padding: 10px; margin-bottom: 15px; border: 1px solid #555; font-family: monospace; letter-spacing: 5px;
@@ -156,10 +210,22 @@
 </head>
 <body>
 
+    <div id="estopModal" class="modal" style="background: rgba(139, 0, 0, 0.95); z-index: 9999; display: none; flex-direction: column;">
+        <div class="modal-content" style="border-color: #fff; text-align: center; max-width: 500px; padding: 40px; background: #600;">
+            <div style="font-size: 5rem; margin-bottom: 20px;">⚠️</div>
+            <h1 style="color: #fff; font-size: 2.5rem; margin: 0; text-transform: uppercase; letter-spacing: 2px;">Emergency Stop</h1>
+            <p style="color: #ddd; font-size: 1.2rem; margin-top: 15px; font-weight: bold;">HARDWARE STOP TLAČÍTKO AKTIVOVÁNO</p>
+            <div style="margin-top: 30px; padding: 15px; border: 2px dashed #fff; color: #fff; font-weight: bold;">ODJISTĚTE PRO POKRAČOVÁNÍ</div>
+            <button class="btn-stop" onclick="confirmShutdown()" style="margin-top: 40px; width: 100%; padding: 20px; border: 2px solid white;">
+                VYPNOUT RASPBERRY PI
+                <span style="color: #fff;">Bezpečné ukončení systému</span>
+            </button>
+        </div>
+    </div>
+
     <div class="top-bar">
-        <h1>Eurofarms Agro-Bot</h1>
+        <h1>Diplomová práce</h1>
         <div style="display:flex; gap:15px; align-items:center;">
-            <div class="clock" id="clock">--:--</div>
             <div class="settings-icon" onclick="openPinModal()">⚙️</div>
         </div>
     </div>
@@ -169,32 +235,19 @@
             <div class="widget" style="flex: 0 0 auto;">
                 <div class="w-header green">Počítadla</div>
                 <div class="w-body" style="padding: 4px;">
-                    <div class="stat-row">
-                        <span class="stat-lbl">Session</span>
-                        <span class="stat-val" id="sessionShots">0</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-lbl">Total</span>
-                        <span class="stat-val" id="totalShots">0</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-lbl">Objem</span>
-                        <span class="stat-val" id="volumeDisplay">0 ml</span>
-                    </div>
-                    <div class="stat-row">
-                        <span class="stat-lbl">Provoz</span>
-                        <span class="stat-val" id="runtimeDisplay">0h 0m</span>
+                    <div class="stat-row"><span class="stat-lbl">Session</span><span class="stat-val" id="sessionShots">0</span></div>
+                    <div class="stat-row"><span class="stat-lbl">Total</span><span class="stat-val" id="totalShots">0</span></div>
+                    <div class="stat-row"><span class="stat-lbl">Objem</span><span class="stat-val" id="volumeDisplay">0 ml</span></div>
+                    <div class="stat-row" style="border-left-color: #ff5722;">
+                        <span class="stat-lbl">CPU Temp</span>
+                        <span class="stat-val" id="tempDisplay">--°C</span>
                     </div>
                 </div>
             </div>
-
             <div class="widget" style="flex: 0 0 auto;">
                 <div class="w-header">Stav Systému</div>
-                <div class="w-body" style="background:black; text-align:center;">
-                    <h2 id="systemStatus" style="margin:0; color:#007bff;">IDLE</h2>
-                </div>
+                <div class="w-body" style="background:black; text-align:center;"><h2 id="systemStatus" style="margin:0; color:#007bff;">IDLE</h2></div>
             </div>
-
             <div class="widget" style="flex: 1;">
                 <div class="w-header">Cílová Dávka</div>
                 <div class="w-body">
@@ -217,9 +270,16 @@
 
         <div class="col-panel">
             <div class="widget" style="height: 100%;">
-                <div class="w-header">Monitoring Zásobníků</div>
+                <div class="w-header">Monitoring pozic</div>
                 <div class="w-body" style="background:#000; padding:4px;">
-                    <div class="sensor-grid-visual" id="sensorGrid"></div>
+                    <div class="sensor-grid-visual" id="sensorGrid">
+                        <div class="sensor-box" id="sensor_0"><div class="s-id">Z1</div><div class="s-fill"></div><div class="s-status" id="txt_0">-</div></div>
+                        <div class="sensor-box" id="sensor_1"><div class="s-id">Z2</div><div class="s-fill"></div><div class="s-status" id="txt_1">-</div></div>
+                        <div class="sensor-box" id="sensor_2"><div class="s-id">Z3</div><div class="s-fill"></div><div class="s-status" id="txt_2">-</div></div>
+                        <div class="sensor-box" id="sensor_3"><div class="s-id">Z4</div><div class="s-fill"></div><div class="s-status" id="txt_3">-</div></div>
+                        <div class="sensor-box" id="sensor_4"><div class="s-id">Z5</div><div class="s-fill"></div><div class="s-status" id="txt_4">-</div></div>
+                        <div class="sensor-box" id="sensor_5"><div class="s-id">Z6</div><div class="s-fill"></div><div class="s-status" id="txt_5">-</div></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -229,9 +289,9 @@
                 <div class="w-header">Rychlá Volba</div>
                 <div class="w-body">
                     <div class="control-grid">
-                        <button class="btn-start" id="mainButton">START<span>AUTO SEQUENCE</span></button>
-                        <button class="btn-flush" id="flushButton">PROPLACH<span>CLEANING</span></button>
-                        <button style="opacity:0.5; cursor:default;">LIGHTS<span>(AUTO)</span></button>
+                        <button class="btn-start" id="mainButton">START</button>
+                        <button class="btn-flush" id="flushButton">PROPLACH</button>
+                        <button id="lightsButton" onclick="sendControl('lights_toggle')">SVĚTLA<span id="lightsStatusLabel">OFF</span></button>
                         <button class="btn-stop" onclick="confirmShutdown()">SHUTDOWN<span>SYSTEM OFF</span></button>
                     </div>
                 </div>
@@ -244,18 +304,10 @@
             <h2 style="color:var(--jd-yellow); text-align:center; margin-top:0;">ZADEJTE PIN</h2>
             <div id="pinDisplay" class="pin-display">_ _ _ _</div>
             <div class="pin-grid">
-                <button class="pin-key" onclick="addPin(1)">1</button>
-                <button class="pin-key" onclick="addPin(2)">2</button>
-                <button class="pin-key" onclick="addPin(3)">3</button>
-                <button class="pin-key" onclick="addPin(4)">4</button>
-                <button class="pin-key" onclick="addPin(5)">5</button>
-                <button class="pin-key" onclick="addPin(6)">6</button>
-                <button class="pin-key" onclick="addPin(7)">7</button>
-                <button class="pin-key" onclick="addPin(8)">8</button>
-                <button class="pin-key" onclick="addPin(9)">9</button>
-                <button class="pin-key clear" onclick="clearPin()">C</button>
-                <button class="pin-key" onclick="addPin(0)">0</button>
-                <button class="pin-key enter" onclick="checkPin()">OK</button>
+                <button class="pin-key" onclick="addPin(1)">1</button><button class="pin-key" onclick="addPin(2)">2</button><button class="pin-key" onclick="addPin(3)">3</button>
+                <button class="pin-key" onclick="addPin(4)">4</button><button class="pin-key" onclick="addPin(5)">5</button><button class="pin-key" onclick="addPin(6)">6</button>
+                <button class="pin-key" onclick="addPin(7)">7</button><button class="pin-key" onclick="addPin(8)">8</button><button class="pin-key" onclick="addPin(9)">9</button>
+                <button class="pin-key clear" onclick="clearPin()">C</button><button class="pin-key" onclick="addPin(0)">0</button><button class="pin-key enter" onclick="checkPin()">OK</button>
             </div>
             <button class="close-btn" onclick="closePin()" style="margin-top:10px;">ZRUŠIT</button>
         </div>
@@ -263,165 +315,188 @@
 
     <div id="calibModal" class="modal">
         <div class="modal-content">
-            <div style="border-bottom:1px solid #444; padding-bottom:10px; margin-bottom:15px; display:flex; justify-content:space-between;">
-                <h2 style="color:var(--jd-yellow); margin:0;">KALIBRACE SERVA</h2>
-                <span style="color:#aaa;">DIAGNOSTIC</span>
+            <div style="border-bottom:1px solid #444; padding-bottom:5px; margin-bottom:10px; display:flex; justify-content:space-between;">
+                <h2 style="color:var(--jd-yellow); margin:0; font-size:1.2rem;">NASTAVENÍ SYSTÉMU</h2><span style="color:#aaa;"></span>
             </div>
+            
             <div id="calibList" class="calib-list">Načítám...</div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #444;">
+                <div class="calib-row" style="margin: 0;">
+                    <div style="display:flex; justify-content:space-between; color:#aaa; font-size:0.8rem; margin-bottom:5px;">
+                        <span>JAS LED</span><span style="color:var(--jd-yellow); font-weight:bold; font-family:monospace;" id="brightnessValDisplay">200</span>
+                    </div>
+                    <input type="range" min="0" max="255" value="200" id="brightnessSlider" onchange="updateBrightness(this.value)" oninput="document.getElementById('brightnessValDisplay').innerText=this.value">
+                </div>
+
+                <button class="btn-stop" onclick="exitKioskMode()" style="padding:10px; border:2px solid #fff;">
+                    VYPNOUT KIOSK
+                    <span style="color:#fff;">Do desktopu</span>
+                </button>
+            </div>
+
             <button class="close-btn" onclick="closeCalibration()">ULOŽIT A ZAVŘÍT</button>
         </div>
     </div>
 
     <script>
-        // --- KONFIGURACE ---
-        const MIN_ML = 35;
-        const MAX_ML = 120;
-        const CORRECT_PIN = "1234"; // Váš tajný kód pro servis
-
-        let targetDoseML = 40;
+        const MIN_ML = 10, MAX_ML = 40, CORRECT_PIN = "1234"; 
+        let targetDoseML = 40, currentPin = "";
+        let lastDoseChangeTime = 0;
         
-        // --- PIN LOGIKA ---
-        let currentPin = "";
-        const pinModal = document.getElementById('pinModal');
-        const pinDisplay = document.getElementById('pinDisplay');
-
-        function openPinModal() {
-            currentPin = "";
-            updatePinDisplay();
-            pinModal.style.display = 'flex';
+        function setDocHeight() {
+            let vh = window.innerHeight * 0.01;
+            document.documentElement.style.setProperty('--vh', `${vh}px`);
         }
-        function closePin() { pinModal.style.display = 'none'; }
-        
-        function addPin(n) {
-            if(currentPin.length < 4) { currentPin += n; updatePinDisplay(); }
-        }
-        function clearPin() { currentPin = ""; updatePinDisplay(); }
-        
-        function updatePinDisplay() {
-            let d = "";
-            for(let i=0; i<4; i++) d += (i < currentPin.length) ? "*" : "_";
-            pinDisplay.innerText = d;
-        }
-
-        function checkPin() {
-            if(currentPin === CORRECT_PIN) {
-                closePin();
-                openCalibration(); // Otevře skutečné menu
-            } else {
-                alert("CHYBNÝ PIN!");
-                clearPin();
-            }
-        }
-
-        // --- HLAVNÍ LOGIKA ---
-        function updateClock() { document.getElementById('clock').textContent = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
-        setInterval(updateClock, 1000); updateClock();
-
-        const sensorGrid = document.getElementById('sensorGrid');
-        for (let i = 0; i < 6; i++) {
-            sensorGrid.innerHTML += `<div class="sensor-box" id="sensor_${i}"><div class="s-id">Z${i+1}</div><div class="s-fill"></div><div class="s-status" id="txt_${i}">-</div></div>`;
-        }
+        window.addEventListener('resize', setDocHeight);
+        window.addEventListener('orientationchange', setDocHeight);
+        setDocHeight();
 
         const els = {
             sysStatus: document.getElementById('systemStatus'),
             session: document.getElementById('sessionShots'),
             total: document.getElementById('totalShots'),
             volume: document.getElementById('volumeDisplay'),
-            runtime: document.getElementById('runtimeDisplay'),
             doseDisp: document.getElementById('targetDoseDisplay'),
-            glassFill: document.getElementById('glassFill')
+            glassFill: document.getElementById('glassFill'),
+            lightsBtn: document.getElementById('lightsButton'),
+            lightsLbl: document.getElementById('lightsStatusLabel'),
+            estopModal: document.getElementById('estopModal')
         };
+
+        function updateDoseDisplay() { 
+            els.doseDisp.innerText = targetDoseML; 
+            let percent = ((targetDoseML - MIN_ML) / (MAX_ML - MIN_ML)) * 100; 
+            els.glassFill.style.height = Math.max(5, percent) + "%"; 
+        }
+
+        async function sendControl(action, value = null) { try { await fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, value}) }); } catch(e){ console.error(e); } }
+        async function updateBrightness(val) { try { await fetch('/api/settings/brightness', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ value: parseInt(val) }) }); } catch(e) { console.error(e); } }
+
+        async function exitKioskMode() {
+            if (!confirm("Opravdu vypnout kiosk režim a vrátit se do desktopu?")) return;
+            try {
+                await fetch('/api/system/exit_kiosk', { method:'POST' });
+            } catch (e) {
+                alert("Nepodařilo se vypnout kiosk režim.");
+            }
+        }
 
         function changeDose(amount) {
-            targetDoseML += amount;
-            if (targetDoseML < MIN_ML) targetDoseML = MIN_ML;
-            if (targetDoseML > MAX_ML) targetDoseML = MAX_ML;
+            targetDoseML += amount; 
+            targetDoseML = Math.max(MIN_ML, Math.min(MAX_ML, targetDoseML));
             updateDoseDisplay();
-            let potVal = Math.round(((targetDoseML - MIN_ML) / (MAX_ML - MIN_ML)) * 1023);
-            if(potVal < 0) potVal = 0; if(potVal > 1023) potVal = 1023;
-            sendControl('pot_set', potVal);
+            
+            lastDoseChangeTime = Date.now();
+            
+            sendControl('target_ml_set', targetDoseML);
         }
 
-        function updateDoseDisplay() {
-            els.doseDisp.innerText = targetDoseML;
-            let percent = ((targetDoseML - MIN_ML) / (MAX_ML - MIN_ML)) * 100;
-            if (percent < 5) percent = 5; if (percent > 100) percent = 100;
-            els.glassFill.style.height = percent + "%";
-        }
+        const pinModal = document.getElementById('pinModal'), pinDisplay = document.getElementById('pinDisplay');
+        function openPinModal() { currentPin = ""; updatePinDisplay(); pinModal.style.display = 'flex'; }
+        function closePin() { pinModal.style.display = 'none'; }
+        function addPin(n) { if(currentPin.length < 4) { currentPin += n; updatePinDisplay(); } }
+        function clearPin() { currentPin = ""; updatePinDisplay(); }
+        function updatePinDisplay() { let d = ""; for(let i=0; i<4; i++) d += (i < currentPin.length) ? "*" : "_"; pinDisplay.innerText = d; }
+        function checkPin() { if(currentPin === CORRECT_PIN) { closePin(); openCalibration(); } else { alert("CHYBNÝ PIN!"); clearPin(); } }
 
-        async function sendControl(action, value = null) {
-            try { await fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, value})}); } catch(e){}
-        }
-
-        async function updateStatus() {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-
-                els.sysStatus.textContent = data.system;
-                els.sysStatus.style.color = data.system === 'RUNNING_SEQ' ? '#FFDE00' : data.system === 'FLUSHING' ? '#00e676' : '#4fc3f7';
-                
-                els.session.textContent = data.stats.session_shots;
-                els.total.textContent = data.stats.total_shots;
-                
-                if (data.display_stats) {
-                    els.volume.textContent = data.display_stats.volume;
-                    els.runtime.textContent = data.display_stats.runtime;
-                }
-
-                let serverPot = data.pot_value;
-                let calculatedML = Math.round((serverPot / 1023.0) * (MAX_ML - MIN_ML) + MIN_ML);
-                if (Math.abs(calculatedML - targetDoseML) > 5) {
-                    targetDoseML = calculatedML;
-                    updateDoseDisplay();
-                }
-
-                Object.keys(data.sensors).forEach(idx => {
-                    const s = data.sensors[idx];
-                    const box = document.getElementById(`sensor_${idx}`);
-                    const txt = document.getElementById(`txt_${idx}`);
-                    box.className = 'sensor-box';
-                    let label = 'EMPTY';
-                    if (s.DOSE === 'PUMPED') { box.classList.add('D-PUMPED'); label = 'OK'; }
-                    else if (s.SENSOR === 'ON') {
-                        box.classList.add('S-ON');
-                        label = s.DOSE === 'READY' ? (box.classList.add('D-READY'), 'READY') : 'DETECT';
-                    }
-                    txt.textContent = label;
-                });
-            } catch(e){}
-        }
-
-        const bindBtn = (id, act) => {
-            const b = document.getElementById(id);
-            ['mousedown','touchstart'].forEach(e=>b.addEventListener(e, (ev)=>{if(ev.type=='touchstart')ev.preventDefault(); sendControl(act+'_down')}));
-            ['mouseup','touchend'].forEach(e=>b.addEventListener(e, (ev)=>{if(ev.type=='touchend')ev.preventDefault(); sendControl(act+'_up')}));
-        };
-        bindBtn('mainButton','main'); bindBtn('flushButton','flush');
-
-        function confirmShutdown() { if(confirm("Vypnout systém?")) fetch('/api/system/shutdown', {method:'POST'}); }
-
-        // --- KALIBRACE (Volá se až po úspěšném PINu) ---
-        const modal = document.getElementById('calibModal');
-        const calibList = document.getElementById('calibList');
+        const modal = document.getElementById('calibModal'), calibList = document.getElementById('calibList');
         async function openCalibration() {
             try {
                 const res = await fetch('/api/calibration');
                 const pos = await res.json();
                 calibList.innerHTML = '';
                 pos.forEach((ang, i) => {
-                    calibList.innerHTML += `
-                    <div class="calib-row"><div style="display:flex;justify-content:space-between;color:#aaa;font-size:0.8rem;margin-bottom:5px;"><span>POZICE Z${i+1}</span><span style="color:var(--jd-yellow);font-weight:bold;font-family:monospace;" id="val_${i}">${ang}°</span></div>
-                    <input type="range" min="0" max="180" value="${ang}" onchange="updateServo(${i},this.value)" oninput="document.getElementById('val_${i}').innerText=this.value+'°'"></div>`;
+                    calibList.innerHTML += `<div class="calib-row"><div style="display:flex;justify-content:space-between;color:#aaa;font-size:0.8rem;margin-bottom:5px;"><span>POZICE Z${i+1}</span><span style="color:var(--jd-yellow);font-weight:bold;font-family:monospace;" id="val_${i}">${ang}°</span></div><input type="range" min="0" max="180" value="${ang}" onchange="updateServo(${i},this.value)" oninput="document.getElementById('val_${i}').innerText=this.value+'°'"></div>`;
                 });
                 modal.style.display = 'flex';
             } catch(e) { alert("Chyba kalibrace"); }
         }
         function closeCalibration() { modal.style.display = 'none'; }
-        async function updateServo(i, a) { await fetch('/api/calibration', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index:i, angle:a})}); }
+        async function updateServo(i, a)
+         { await fetch('/api/calibration', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index:i, angle:a})}); }
 
-        setInterval(updateStatus, 500); updateStatus();
-        updateDoseDisplay(); 
+        function confirmShutdown() { if(confirm("Opravdu vypnout systém?")) fetch('/api/system/shutdown', {method:'POST'}); }
+
+        const bindBtn = (id, act) => {
+            const b = document.getElementById(id);
+            b.onmousedown = () => sendControl(act + '_down');
+            b.onmouseup = () => sendControl(act + '_up');
+            b.ontouchstart = (e) => { e.preventDefault(); sendControl(act + '_down'); };
+            b.ontouchend = (e) => { e.preventDefault(); sendControl(act + '_up'); };
+        };
+        bindBtn('mainButton','main'); bindBtn('flushButton','flush');
+
+        async function updateStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+
+                if (data.system === 'ESTOP') {
+                    els.estopModal.style.display = 'flex';
+                    els.sysStatus.style.color = '#ff0000';
+                    els.sysStatus.innerText = "!!! ESTOP !!!";
+                } else if (data.system === 'DISCONNECTED') {
+                    els.estopModal.style.display = 'none';
+                    els.sysStatus.style.color = '#ff9800';
+                    els.sysStatus.innerText = "DISCONNECTED";
+                } else {
+                    els.estopModal.style.display = 'none';
+                    els.sysStatus.textContent = data.system;
+                    els.sysStatus.style.color = data.system === 'RUNNING_SEQ' ? '#FFDE00' : data.system === 'FLUSHING' ? '#ff9800' : '#007bff';
+                }
+
+                els.session.textContent = data.stats.session_glasses;
+                els.total.textContent = data.stats.total_glasses;
+                
+                if (data.display_stats) { 
+                    els.volume.textContent = data.display_stats.volume; 
+                    const tempEl = document.getElementById('tempDisplay');
+                    if (tempEl && data.display_stats.cpu_temp !== undefined) {
+                        const t = data.display_stats.cpu_temp;
+                        tempEl.innerText = t + "°C";
+                        if (t >= 70) tempEl.style.color = "#ff0000";
+                        else if (t >= 60) tempEl.style.color = "#ff9800";
+                        else tempEl.style.color = "#ffffff";
+                    }
+                }
+
+                if (data.lights_on) { els.lightsBtn.classList.add('lights-active'); els.lightsLbl.innerText = "ON"; } 
+                else { els.lightsBtn.classList.remove('lights-active'); els.lightsLbl.innerText = "OFF"; }
+
+                if (document.getElementById('calibModal').style.display !== 'flex') {
+                     if (data.stats && data.stats.led_brightness !== undefined) {
+                        document.getElementById('brightnessSlider').value = data.stats.led_brightness;
+                        document.getElementById('brightnessValDisplay').innerText = data.stats.led_brightness;
+                    }
+                }
+
+                let calculatedML = data.target_ml;
+                if (Date.now() - lastDoseChangeTime > 500) {
+                    if (calculatedML !== undefined && Math.abs(calculatedML - targetDoseML) > 0.5) { 
+                        targetDoseML = calculatedML; 
+                        updateDoseDisplay(); 
+                    }
+                }
+
+                Object.keys(data.sensors).forEach(idx => {
+                    const s = data.sensors[idx], box = document.getElementById(`sensor_${idx}`), txt = document.getElementById(`txt_${idx}`);
+                    if (!box || !txt) return;
+                    box.className = 'sensor-box'; let label = 'EMPTY';
+                    if (data.system === 'FLUSHING') { box.classList.add('F-FLUSHING'); label = 'CLEAN'; } 
+                    else if (s.DOSE === 'PUMPED') { box.classList.add('D-PUMPED'); label = 'OK'; }
+                    else if (s.SENSOR === 'ON') { box.classList.add('S-ON'); label = s.DOSE === 'READY' ? (box.classList.add('D-READY'), 'READY') : 'DETECT'; }
+                    txt.textContent = label;
+                });
+            } catch(e) {
+                els.estopModal.style.display = 'none';
+                els.sysStatus.style.color = '#ff0000';
+                els.sysStatus.innerText = "OFFLINE";
+            }
+        }
+
+        setInterval(updateStatus, 100); 
+        updateStatus(); updateDoseDisplay(); 
     </script>
 </body>
 </html>
