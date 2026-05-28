@@ -1,0 +1,5 @@
+Flask==3.0.0
+flasgger==0.9.7.1
+pyserial==3.5
+numpy==1.26.0
+RPi.GPIO==0.7.1; platform_machine=='armv7l' or platform_machine=='aarch64'
