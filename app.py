@@ -10,17 +10,19 @@ import sqlite3
 import numpy as np
 import logging
 
-#KONFIGURACE
+# --- KONFIGURACE ---
 SERIAL_PORT = 'COM5' if os.name == 'nt' else '/dev/ttyUSB0'
 BAUD_RATE = 115200
 DB_FILE = 'logs.db'
 FAN_PIN = 27 # Pin pro MOSFET ventilátoru
 
+# Pevně nastavené PWM pro čerpadlo
+HARDCODED_PUMP_PWM = 150
 
 # Výchozí polohy serva
 DEFAULT_POSITIONS = [157, 141, 125, 104, 87, 68]
 
-# GLOBÁLNÍ PROMĚNNÉ
+# --- GLOBÁLNÍ PROMĚNNÉ ---
 app = Flask(__name__)
 
 # Konfigurace Swagger dokumentace
@@ -41,7 +43,7 @@ swagger_config = {
 swagger = Swagger(app, config=swagger_config, template={
     "info": {
         "title": "Masters Thesis API",
-        "description": "API pro řízení a monitorování automatického dávkovače alkoholu",
+        "description": "API pro řízení a monitorování automatického dávkovače",
         "version": "1.2.0"
     }
 })
@@ -70,7 +72,7 @@ stats = {
 }
 calibration_data = list(DEFAULT_POSITIONS)
 
-# PROMĚNNÉ PRO RETRY MECHANISMUS A CHYBY
+#PROMĚNNÉ PRO RETRY MECHANISMUS A CHYBY 
 pending_command = None
 retry_count = 0
 last_command_time = 0
@@ -102,7 +104,7 @@ try:
     GPIO_AVAILABLE = True
 except: pass
 
-#  DATABÁZE
+# --- DATABÁZE ---
 def init_db():
     with db_lock:
         try:
@@ -119,24 +121,24 @@ def init_db():
                 for i, angle in enumerate(DEFAULT_POSITIONS):
                     c.execute("INSERT INTO servo_calibration (position_index, angle) VALUES (?, ?)", (i, angle))
             
-            # NOVÁ STRUKTURA KALIBRAČNÍ TABULKY (Objem -> Čas)
+            
             c.execute('''CREATE TABLE IF NOT EXISTS volume_calibration (
                         volume_ml REAL PRIMARY KEY, 
                         duration_ms INTEGER NOT NULL)''')
             
             c.execute("SELECT COUNT(*) FROM volume_calibration")
             if c.fetchone()[0] == 0:
-                
+                print("DB >> Inicializuji empirickou kalibrační tabulku (LUT) z reálného měření...")
                 defaults = [
-                    (1.85, 50), (2.41, 100), (4.00, 150), (4.44, 200), (5.50, 250),
-                    (6.67, 300), (7.41, 350), (8.52, 400), (9.24, 450), (10.31, 500),
-                    (11.15, 550), (11.89, 600), (12.46, 650), (13.52, 700), (14.09, 750),
-                    (15.33, 800), (16.63, 850), (17.59, 900), (18.56, 950), (19.61, 1000),
-                    (20.61, 1050), (21.41, 1100), (22.26, 1150), (23.43, 1200), (24.13, 1250),
-                    (24.46, 1300), (25.09, 1350), (25.41, 1400), (27.46, 1450), (28.43, 1500),
-                    (29.15, 1550), (30.30, 1600), (31.39, 1650), (32.28, 1700), (33.53, 1750),
-                    (34.93, 1800), (35.63, 1850), (36.79, 1900), (38.49, 1950), (39.51, 2000), (39.6, 2050), (39.8, 2100), (40.1, 2150)
-                ]
+    (1.85, 50), (2.41, 100), (4.00, 150), (4.44, 200), (5.50, 250),
+    (6.67, 300), (7.41, 350), (8.52, 400), (9.24, 450), (10.31, 500),
+    (11.15, 550), (11.89, 600), (12.46, 650), (13.52, 700), (14.09, 750),
+    (15.33, 800), (16.63, 850), (17.59, 900), (18.56, 950), (19.61, 1000),
+    (20.61, 1050), (21.41, 1100), (22.26, 1150), (23.43, 1200), (24.13, 1250),
+    (24.46, 1300), (25.09, 1350), (25.41, 1400), (27.46, 1450), (28.43, 1500),
+    (29.15, 1550), (30.30, 1600), (31.39, 1650), (32.28, 1700), (33.53, 1750),
+    (34.93, 1800), (35.63, 1850), (36.79, 1900), (38.49, 1950), (39.51, 2000), (39.6, 2050), (39.8, 2100), (40.1, 2150)
+]
                 c.executemany("INSERT INTO volume_calibration (volume_ml, duration_ms) VALUES (?, ?)", defaults)
 
             conn.commit()
@@ -156,6 +158,7 @@ def load_all_data_from_db():
             if row:
                 stats['total_glasses'], stats['total_volume_ml'], stats['total_runtime_sec'], stats['led_brightness'] = row
             
+            # OPRAVENO: Vyhledává logy typu 'GLASS', aby to ladilo se zápisem dole
             c.execute("SELECT COUNT(*) FROM logs WHERE event_type='GLASS' AND date(timestamp) = date('now')")
             stats['session_glasses'] = c.fetchone()[0]
 
@@ -165,7 +168,7 @@ def load_all_data_from_db():
                 db_list = [r[1] for r in rows]
                 calibration_data[:] = (db_list + DEFAULT_POSITIONS[len(db_list):])[:6]
             
-            # Načtení objemové kalibrace
+            # Načtení objemové kalibrace (seřazeno vzestupně pro NumPy interpolaci)
             c.execute("SELECT volume_ml, duration_ms FROM volume_calibration ORDER BY volume_ml ASC")
             rows = c.fetchall()
             if rows:
@@ -202,24 +205,26 @@ def write_log(event_type, volume=0.0, details=""):
             conn.close()
         except Exception as e: print(f"Log Error: {e}")
 
+def update_fan_status_file(is_on):
+    with open("fan_status.txt", "w") as f:
+        f.write("1" if is_on else "0")
 def get_rpi_temp():
     global fan_active
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
             temp_c = int(round(int(f.read()) / 1000.0))
             if GPIO_AVAILABLE:
-                # Dvoupolohový regulátor s hysterezí
                 if temp_c >= 40 and not fan_active:
                     GPIO.output(FAN_PIN, GPIO.HIGH)
                     fan_active = True
+                    update_fan_status_file(True) # PŘIDAT TOTO
                 elif temp_c <= 30 and fan_active:
                     GPIO.output(FAN_PIN, GPIO.LOW)
                     fan_active = False
+                    update_fan_status_file(False) # PŘIDAT TOTO
             return temp_c
-    except:
-        return 0
-
-# VÝPOČET ČASU ČERPÁNÍ 
+    except: return 0
+# VÝPOČET ČASU ČERPÁNÍ (Lineární interpolace z LUT)
 def calculate_pump_time(target_ml):
     global LUT_DATA
     if LUT_DATA is None or len(LUT_DATA) == 0:
@@ -228,12 +233,12 @@ def calculate_pump_time(target_ml):
     volumes = LUT_DATA[:, 0]
     durations = LUT_DATA[:, 1]
 
-    # np.interp spolehlivě interpoluje na základě dodané empirické tabulky
+    # np.interp interpoluje na základě dodané empirické tabulky
     duration_ms = np.interp(target_ml, volumes, durations)
     
     return int(duration_ms)
 
-# KOMUNIKACE
+# KOMUNIKACE 
 def send_to_arduino(body, is_retry=False):
     global ser, pending_command, retry_count, last_command_time
     with serial_lock:
@@ -388,12 +393,12 @@ def serial_monitor():
             
         time.sleep(0.005)
 
-# API
+# API 
 
 @app.route('/')
 def index(): 
     """
-    Hlavní uživatelské rozhraní
+    Hlavní uživatelské rozhraní (HMI)
     ---
     tags:
       - Frontend
@@ -406,7 +411,7 @@ def index():
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """
-    Kompletní stav stroje
+    Kompletní telemetrie a stav stroje
     ---
     tags:
       - Monitoring
@@ -483,7 +488,7 @@ def post_control():
 @app.route('/api/calibration', methods=['GET', 'POST'])
 def calib():
     """
-    Čtení a zápis kalibrace
+    Čtení a zápis kinematické kalibrace
     ---
     tags:
       - Kalibrace
@@ -551,7 +556,7 @@ def set_brightness():
 @app.route('/api/system/exit_kiosk', methods=['POST'])
 def exit_kiosk():
     """
-    Ukončení Kiosk režimu displeje
+    Nouzové ukončení Kiosk režimu displeje
     ---
     tags:
       - Systém
@@ -572,7 +577,7 @@ def exit_kiosk():
 @app.route('/api/system/shutdown', methods=['POST'])
 def shutdown():
     """
-    Bezpečné vypnutí řídicího počítače
+    Bezpečné vypnutí řídicího počítače (Halt)
     ---
     tags:
       - Systém
@@ -593,8 +598,7 @@ if __name__ == '__main__':
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     app.logger.setLevel(logging.ERROR) 
-
-
+    
     monitor_thread = threading.Thread(target=serial_monitor, daemon=True)
     monitor_thread.start()
     
