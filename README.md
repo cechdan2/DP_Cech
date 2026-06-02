@@ -19,6 +19,7 @@ Tento projekt využívá následující doporučenou strukturu adresářů:
  ├── requirements.txt
  ├── README.md
  ├── LICENSE
+ └── drawings/
  └── templates/
       └── index.html
 ```
